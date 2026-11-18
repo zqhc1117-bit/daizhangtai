@@ -1,0 +1,15 @@
+{
+  "ok": true,
+  "browser_errors": [],
+  "report_business_data_unchanged": true,
+  "payroll_vouchers": 3,
+  "formats": [
+    "xlsx",
+    "xls",
+    "csv",
+    "gb18030 csv",
+    "PDF",
+    "PNG OCR",
+    "scanned PDF"
+  ]
+}

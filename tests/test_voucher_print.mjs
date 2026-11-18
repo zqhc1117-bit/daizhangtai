@@ -1,0 +1,37 @@
+import assert from 'node:assert/strict';
+import {DEFAULT_PRINT_SETTINGS,PRINT_LAYOUTS,normalizePrintSettings,paginateVouchers,voucherPrintMarkup,printVoucherSheets} from '../public/voucher-print.js';
+const book={client:{id:1,name:'合成<打印公司>'},accounts:[]};
+const voucher=(id,count=2)=>({id,number:id,date:'2026-09-17',status:'active',created_by_name:'合成制单人',lines:Array.from({length:count},(_,i)=>({account_code:i?'500101':'1002',account_name:i?'客户明细':'银行存款',summary:i?'主营业务收入':'银行存款',debit_fen:i?0:750000,credit_fen:i?750000:0}))});
+const items=[voucher(1),voucher(2),voucher(3)];
+assert.equal(DEFAULT_PRINT_SETTINGS.layout,'a4-two');
+assert.deepEqual(paginateVouchers(items).map(p=>p.map(s=>s.voucher.id)),[[1,2],[3]]);
+assert.deepEqual(paginateVouchers(items,{layout:'a4-three'}).map(p=>p.length),[3]);
+assert.deepEqual(paginateVouchers(items,{layout:'a4-one'}).map(p=>p.length),[1,1,1]);
+const long=voucher(4,13),chunks=paginateVouchers([long]).flat();
+assert.deepEqual(chunks.map(s=>[s.part,s.parts,s.lines.length]),[[1,3,5],[2,3,5],[3,3,3]]);
+assert.deepEqual(chunks.flatMap(s=>s.lines),long.lines,'Continuation must retain every original entry in order.');
+assert.deepEqual(paginateVouchers([long],{rows:7}).flat().map(s=>s.lines.length),[7,6]);
+const verbose={...voucher(5,5),lines:voucher(5,5).lines.map(l=>({...l,summary:'费用'.repeat(100)}))};
+assert.equal(paginateVouchers([verbose]).flat().length,5,'Long text must create additional continuation slips rather than overlap.');
+assert.equal(paginateVouchers([verbose]).flat().flatMap(s=>s.lines).length,5);
+assert.equal(paginateVouchers([{...items[0],status:'void'}]).length,0);
+assert.equal(paginateVouchers([{...items[0],status:'void'}],{includeVoid:true}).length,1);
+for(const layout of Object.keys(PRINT_LAYOUTS))assert.ok(voucherPrintMarkup(items,book,{layout}).includes('data-print-page="1"'));
+const html=voucherPrintMarkup([long],book,{hideCode:true,preparer:false});
+assert.match(html,/合成&lt;打印公司&gt;/);assert.match(html,/本页合计/);assert.match(html,/凭证合计/);assert.match(html,/记-004（3\/3）/);
+assert.doesNotMatch(html,/500101|1002|制单人：/);
+const hostile={...voucher(6),lines:[{account_name:'<img src=x>',summary:'<script>alert(1)</script>',debit_fen:-12500}]};
+const red=voucherPrintMarkup([hostile],book,{layout:'a4-two-digits'});
+assert.match(red,/vp-negative/);assert.doesNotMatch(red,/<img|<script>/);assert.match(red,/&lt;script&gt;/);
+for(const opts of [{layout:'bad'},{rows:0},{left:-1},{top:Infinity},{layout:'a4-three',top:30,bottom:30}])assert.throws(()=>normalizePrintSettings(opts));
+
+// The print lifecycle must restore the application and remove transient @page rules.
+const nodes=[],classes=new Set(),listeners=new Map();
+globalThis.document={title:'系统名称',body:{appendChild:n=>nodes.push(n),classList:{add:c=>classes.add(c),remove:c=>classes.delete(c)}},createElement:()=>({appendChild(){},remove(){nodes.splice(nodes.indexOf(this),1);}})};
+globalThis.addEventListener=(event,fn)=>listeners.set(event,fn);
+globalThis.removeEventListener=(event,fn)=>{if(listeners.get(event)===fn)listeners.delete(event);};
+globalThis.print=()=>{assert.equal(document.title,'');assert.ok(classes.has('printing-vouchers'));assert.equal(nodes.length,1);listeners.get('afterprint')();};
+printVoucherSheets(items,book,{});assert.equal(document.title,'系统名称');assert.equal(nodes.length,0);assert.equal(classes.size,0);assert.equal(listeners.size,0);
+globalThis.print=()=>{throw new Error('device unavailable');};
+assert.throws(()=>printVoucherSheets(items,book,{}),/device unavailable/);assert.equal(document.title,'系统名称');assert.equal(nodes.length,0);
+console.log('Voucher layouts, continuation, filtering, amounts, escaping and print cleanup passed');

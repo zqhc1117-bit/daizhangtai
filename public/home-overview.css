@@ -1,0 +1,49 @@
+/* Keep the existing workspace, table and sidebar styling for the merged home. */
+.home-overview .page-head{margin-bottom:12px}
+.home-agency-entry{margin-left:auto}
+.agency-progress .home-progress-table{max-height:calc(100vh - 290px)!important}
+.home-filter-main{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.home-filter-main .searchbar{flex:1;min-width:280px;margin:0}
+.home-filter-main .period-switch{justify-content:flex-start}
+.home-filter-main select{height:31px;min-width:120px}
+.home-more-filters{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:12px;padding-top:12px;border-top:1px solid var(--line)}
+.home-more-filters label{display:flex;align-items:center;gap:7px}
+.home-more-filters select{min-width:140px}
+.home-active-filter{display:flex;align-items:center;gap:12px;padding:8px 0 12px;flex-wrap:wrap}
+.home-progress-table{max-height:calc(100vh - 340px)!important;min-height:250px}
+.home-progress-table thead th{position:sticky;top:0;z-index:1}
+.home-progress-table td{padding:6px 8px}
+.home-company-name{display:inline-flex;align-items:center;gap:3px;white-space:normal;min-width:135px;max-width:245px;line-height:1.5}
+.home-company-name>.link-btn{text-align:left;line-height:1.5}
+.home-todo-tags{display:flex;gap:4px;flex-wrap:wrap;min-width:100px;max-width:190px;justify-content:center}
+.home-progress-table .agency-expiry{padding:4px 6px;font-size:12px}
+.home-progress-table .agency-expiry small{max-width:155px;white-space:normal}
+.home-client-details[hidden],.home-more-filters[hidden]{display:none!important}
+.home-client-details>td{background:#f7fbfc!important;text-align:left;white-space:normal;padding:13px 18px}
+.home-details-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px 24px;align-items:start}
+.home-details-grid>div{display:flex;align-items:center;gap:9px;flex-wrap:wrap;line-height:1.7}
+.home-details-grid .home-detail-note{align-items:flex-start}
+.home-detail-note>span{white-space:pre-wrap;overflow-wrap:anywhere;flex:1;min-width:100px}
+.home-detail-label{font-weight:600;white-space:nowrap}
+.home-stats-content{margin-top:0}
+.home-stats-content .progress-cards{grid-template-columns:repeat(7,minmax(0,1fr));overflow:visible}
+.home-stats-content .progress-card{min-width:0;min-height:0;padding:10px}
+.home-stats-content .card-main{margin:0;gap:8px}
+.home-stats-content .donut{width:60px;height:60px;flex-basis:60px}
+.home-stats-content .donut strong{color:#17617d;font-size:23px}
+.home-stats-content [data-tone=warn] .donut strong{color:#9b6500}
+.home-stats-content [data-tone=bad] .donut strong{color:#b53e49}
+.home-stats-content .summary-empty{background:#e9edf1}
+.home-stats-content [data-summary=book] .donut:not(.summary-empty){background:conic-gradient(var(--orange) 0 var(--a),var(--green) var(--a) 360deg)}
+.home-stats-content [data-summary=book] .card-status button:nth-child(2){background:#f2f9ed;color:#6aaf38}
+.home-summary-text{flex:1;min-width:0}
+.home-summary-label{display:block;max-width:100%;margin:0 0 7px;padding:0;border:0;background:none;font-size:13px;font-weight:600;text-align:left;line-height:1.5;white-space:nowrap}
+.home-summary-label:hover,.home-summary-label[aria-pressed=true]{color:#168d9a;text-decoration:underline}
+.home-stats-content .card-status button{font-size:11px;padding:2px 5px;gap:4px}
+.home-summary-values{display:inline-flex;align-items:center;gap:6px;font-variant-numeric:tabular-nums}
+.home-stats-content .card-status button[aria-pressed=true]{outline:1px solid currentColor}
+@media(max-width:1650px){.home-stats-content .progress-cards{grid-template-columns:repeat(4,minmax(0,1fr))}.home-stats-content .donut{width:68px;height:68px;flex-basis:68px}.home-stats-content .card-status button{font-size:12px}}
+@media(max-width:1300px){.home-filter-main .searchbar{order:5;flex-basis:100%}.home-progress-table{max-height:calc(100vh - 410px)!important}.agency-progress .home-progress-table{max-height:calc(100vh - 335px)!important}}
+@media(max-width:1050px){.home-stats-content .progress-cards{grid-template-columns:repeat(3,minmax(0,1fr))}.home-stats-content .donut{width:56px;height:56px;flex-basis:56px}.home-stats-content .card-status button{font-size:11px}}
+@media(max-width:950px){.home-stats-content .progress-cards{grid-template-columns:repeat(2,minmax(0,1fr))}.home-details-grid{grid-template-columns:1fr}}
+@media print{.home-filters,.home-active-filter,.home-summary,.home-agency-entry{display:none!important}.home-progress-table,.agency-progress .home-progress-table{max-height:none!important}.home-progress-table thead th{position:static}}

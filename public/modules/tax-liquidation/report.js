@@ -1,0 +1,4 @@
+import {h} from './shared/fields.js';
+export function renderReport(report) {
+  return `<article class="tliq-paper tliq-report" aria-label="A4报告预览"><div class="tliq-report-meta">${h(report.sample?'示例数据 · 仅供测试':report.status)}</div><h1>${h(report.title)}</h1><p class="tliq-report-unit">金额单位：人民币元</p>${report.sections.map(section => `<section class="tliq-report-section"><h2>${h(section.title)}</h2>${section.blocks.map(block => block.type==='paragraph'?`<p>${h(block.text)}</p>`:`<table><thead><tr>${block.headers.map(text => `<th>${h(text)}</th>`).join('')}</tr></thead><tbody>${block.rows.map(row => `<tr>${row.map((text,i) => `<td ${block.numeric.includes(i)?'class="tliq-number"':''}>${h(text)}</td>`).join('')}</tr>`).join('')}</tbody></table>`).join('')}</section>`).join('')}<div class="tliq-signatures">${report.signatures.map(text => `<p>${h(text)}</p>`).join('')}</div></article>`;
+}

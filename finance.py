@@ -1,0 +1,2062 @@
+"""Local, auditable double-entry accounting. Money is integer fen, quantity Decimal.
+
+Templates: small2013 includes 66 standard accounts and two supplied extensions;
+enterprise2007 is a common non-financial subset of 财会[2006]18号, not an
+assertion of support for every later standard, special industry or disclosure.
+Sources: https://kjs.mof.gov.cn/zhengcefabu/201111/P020111118325852734144.pdf
+https://czj.sh.gov.cn/zys_8908/zcfg_8983/zcfb_8985/hj_9035/cwhjjbzdgf/20061201/0017-156907.html
+
+Reports are ledger-derived management statements. Cash flows require explicit
+classification; an incomplete report is never labelled an accurate statement.
+"""
+import calendar
+import datetime as dt
+import hashlib
+import json
+import re
+import sqlite3
+from contextlib import contextmanager
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+
+from db import ApiError, amount, audit, now
+from client_profile import expand_client
+from statutory_statements import build_statutory
+
+
+CASH_CATEGORIES = ('operating', 'investing', 'financing', 'transfer', 'unclassified')
+CATEGORIES = ('asset', 'liability', 'equity', 'income', 'expense', 'cost')
+REPORT_KEYS = {
+    'cash': '货币资金', 'short_investment': '短期投资/交易性金融资产',
+    'receivable': '应收款项', 'prepaid': '预付款项', 'inventory': '存货及生产成本',
+    'long_investment': '长期投资', 'fixed_asset': '固定资产净额',
+    'construction': '在建工程及工程物资', 'intangible': '无形资产净额',
+    'other_asset': '其他资产', 'short_debt': '短期借款', 'payable': '应付款项',
+    'advance': '预收款项', 'payroll_payable': '应付职工薪酬', 'tax_payable': '应交税费',
+    'other_liability': '其他负债', 'long_debt': '长期借款及应付款',
+    'capital': '实收资本及资本公积', 'retained': '盈余公积及利润分配',
+    'current_profit': '本年利润', 'revenue': '营业收入', 'investment_income': '投资收益',
+    'other_income': '营业外及其他收益', 'business_cost': '营业成本',
+    'taxes': '税金及附加', 'selling': '销售费用', 'administration': '管理费用',
+    'finance': '财务费用', 'other_expense': '营业外及其他损失', 'income_tax': '所得税费用',
+    'prior_adjustment': '以前年度损益调整（暂不支持记账）',
+}
+
+
+def _legacy_template(standard):
+    common = [
+        ('1001','库存现金','debit','asset','cash'), ('1002','银行存款','debit','asset','cash'),
+        ('1012','其他货币资金','debit','asset','cash'), ('1121','应收票据','debit','asset','receivable'),
+        ('1122','应收账款','debit','asset','receivable'), ('1123','预付账款','debit','asset','prepaid'),
+        ('1131','应收股利','debit','asset','receivable'), ('1132','应收利息','debit','asset','receivable'),
+        ('1221','其他应收款','debit','asset','receivable'),
+        ('1401','材料采购','debit','asset','inventory'), ('1402','在途物资','debit','asset','inventory'),
+        ('1403','原材料','debit','asset','inventory'), ('1404','材料成本差异','debit','asset','inventory'),
+        ('1405','库存商品','debit','asset','inventory'), ('1407','商品进销差价','credit','asset','inventory'),
+        ('1408','委托加工物资','debit','asset','inventory'), ('1411','周转材料','debit','asset','inventory'),
+        ('1601','固定资产','debit','asset','fixed_asset'), ('1602','累计折旧','credit','asset','fixed_asset'),
+        ('1604','在建工程','debit','asset','construction'), ('1605','工程物资','debit','asset','construction'),
+        ('1606','固定资产清理','debit','asset','fixed_asset'),
+        ('1701','无形资产','debit','asset','intangible'), ('1702','累计摊销','credit','asset','intangible'),
+        ('1801','长期待摊费用','debit','asset','other_asset'), ('1901','待处理财产损溢','debit','asset','other_asset'),
+        ('2001','短期借款','credit','liability','short_debt'), ('2201','应付票据','credit','liability','payable'),
+        ('2202','应付账款','credit','liability','payable'), ('2203','预收账款','credit','liability','advance'),
+        ('2211','应付职工薪酬','credit','liability','payroll_payable'), ('2221','应交税费','credit','liability','tax_payable'),
+        ('2231','应付利息','credit','liability','other_liability'), ('2241','其他应付款','credit','liability','other_liability'),
+        ('2401','递延收益','credit','liability','other_liability'), ('2501','长期借款','credit','liability','long_debt'),
+        ('2701','长期应付款','credit','liability','long_debt'),
+    ]
+    if standard == 'small2013':
+        extra = [
+            ('1101','短期投资','debit','asset','short_investment'),
+            ('1421','消耗性生物资产','debit','asset','inventory'),
+            ('1501','长期债券投资','debit','asset','long_investment'), ('1511','长期股权投资','debit','asset','long_investment'),
+            ('1621','生产性生物资产','debit','asset','fixed_asset'), ('1622','生产性生物资产累计折旧','credit','asset','fixed_asset'),
+            ('2232','应付利润','credit','liability','other_liability'),
+            ('3001','实收资本','credit','equity','capital'), ('3002','资本公积','credit','equity','capital'),
+            ('3101','盈余公积','credit','equity','retained'), ('3103','本年利润','credit','equity','current_profit'),
+            ('3104','利润分配','credit','equity','retained'),
+            ('4001','生产成本','debit','cost','inventory'), ('4101','制造费用','debit','cost','inventory'),
+            ('4301','研发支出','debit','cost','other_asset'), ('4401','工程施工','debit','cost','inventory'),
+            ('4403','机械作业','debit','cost','inventory'),
+            ('5001','主营业务收入','credit','income','revenue'), ('5051','其他业务收入','credit','income','revenue'),
+            ('5111','投资收益','credit','income','investment_income'), ('5301','营业外收入','credit','income','other_income'),
+            ('5401','主营业务成本','debit','expense','business_cost'), ('5402','其他业务成本','debit','expense','business_cost'),
+            ('5403','营业税金及附加','debit','expense','taxes'), ('5601','销售费用','debit','expense','selling'),
+            ('5602','管理费用','debit','expense','administration'), ('5603','财务费用','debit','expense','finance'),
+            ('5711','营业外支出','debit','expense','other_expense'), ('5801','所得税费用','debit','expense','income_tax'),
+        ]
+    elif standard == 'enterprise2007':
+        extra = [
+            ('1101','交易性金融资产','debit','asset','short_investment'), ('1231','坏账准备','credit','asset','receivable'),
+            ('1406','发出商品','debit','asset','inventory'), ('1471','存货跌价准备','credit','asset','inventory'),
+            ('1501','持有至到期投资','debit','asset','long_investment'), ('1502','持有至到期投资减值准备','credit','asset','long_investment'),
+            ('1503','可供出售金融资产','debit','asset','long_investment'), ('1511','长期股权投资','debit','asset','long_investment'),
+            ('1512','长期股权投资减值准备','credit','asset','long_investment'), ('1521','投资性房地产','debit','asset','long_investment'),
+            ('1603','固定资产减值准备','credit','asset','fixed_asset'), ('1703','无形资产减值准备','credit','asset','intangible'),
+            ('1811','递延所得税资产','debit','asset','other_asset'), ('2232','应付股利','credit','liability','other_liability'),
+            ('2502','应付债券','credit','liability','long_debt'), ('2711','专项应付款','credit','liability','long_debt'),
+            ('2801','预计负债','credit','liability','other_liability'), ('2901','递延所得税负债','credit','liability','other_liability'),
+            ('4001','实收资本','credit','equity','capital'), ('4002','资本公积','credit','equity','capital'),
+            ('4101','盈余公积','credit','equity','retained'), ('4103','本年利润','credit','equity','current_profit'),
+            ('4104','利润分配','credit','equity','retained'), ('4201','库存股','debit','equity','capital'),
+            ('5001','生产成本','debit','cost','inventory'), ('5101','制造费用','debit','cost','inventory'),
+            ('5201','劳务成本','debit','cost','inventory'), ('5301','研发支出','debit','cost','other_asset'),
+            ('5401','工程施工','debit','cost','inventory'), ('5403','机械作业','debit','cost','inventory'),
+            ('6001','主营业务收入','credit','income','revenue'), ('6051','其他业务收入','credit','income','revenue'),
+            ('6101','公允价值变动损益','credit','income','other_income'), ('6111','投资收益','credit','income','investment_income'),
+            ('6301','营业外收入','credit','income','other_income'), ('6401','主营业务成本','debit','expense','business_cost'),
+            ('6402','其他业务成本','debit','expense','business_cost'), ('6403','营业税金及附加','debit','expense','taxes'),
+            ('6601','销售费用','debit','expense','selling'), ('6602','管理费用','debit','expense','administration'),
+            ('6603','财务费用','debit','expense','finance'), ('6701','资产减值损失','debit','expense','other_expense'),
+            ('6711','营业外支出','debit','expense','other_expense'), ('6801','所得税费用','debit','expense','income_tax'),
+        ]
+    else:
+        raise ApiError(400, '不支持的会计制度')
+    return sorted(common + extra)
+
+
+def _template(standard):
+    rows = _legacy_template(standard)
+    tax_code = '5403' if standard == 'small2013' else '6403'
+    rows = [(code, '税金及附加' if code == tax_code else name, direction, category, report_key)
+            for code, name, direction, category, report_key in rows]
+    if standard == 'small2013':
+        rows = [(code, '税金及附加' if code == '5403' else name, direction, category, report_key)
+                for code, name, direction, category, report_key in rows]
+        rows += [('1133','应收出口退税款','debit','asset','receivable'),
+                 ('5901','以前年度损益调整','debit','expense','prior_adjustment')]
+    return sorted(rows)
+
+
+def init_schema(conn):
+    conn.executescript('''
+    CREATE TABLE IF NOT EXISTS accounts(id INTEGER PRIMARY KEY,client_id INTEGER NOT NULL REFERENCES clients(id),code TEXT NOT NULL,name TEXT NOT NULL,direction TEXT NOT NULL,category TEXT NOT NULL,report_key TEXT NOT NULL,version INTEGER NOT NULL DEFAULT 1,UNIQUE(client_id,code));
+    CREATE TABLE IF NOT EXISTS book_settings(client_id INTEGER PRIMARY KEY REFERENCES clients(id),opening_version INTEGER NOT NULL DEFAULT 1);
+    CREATE TABLE IF NOT EXISTS opening_balances(client_id INTEGER NOT NULL,account_code TEXT NOT NULL,debit_fen INTEGER NOT NULL DEFAULT 0 CHECK(debit_fen>=0),credit_fen INTEGER NOT NULL DEFAULT 0 CHECK(credit_fen>=0),PRIMARY KEY(client_id,account_code),FOREIGN KEY(client_id,account_code) REFERENCES accounts(client_id,code));
+    CREATE TABLE IF NOT EXISTS vouchers(id INTEGER PRIMARY KEY,client_id INTEGER NOT NULL REFERENCES clients(id),date TEXT NOT NULL,period TEXT NOT NULL,number INTEGER NOT NULL,summary TEXT NOT NULL,source_type TEXT NOT NULL DEFAULT 'manual',source_id TEXT,status TEXT NOT NULL DEFAULT 'active',reviewed INTEGER NOT NULL DEFAULT 0,reviewed_by INTEGER REFERENCES users(id),reviewed_at TEXT,version INTEGER NOT NULL DEFAULT 1,created_at TEXT NOT NULL,created_by INTEGER REFERENCES users(id),UNIQUE(client_id,period,number));
+    CREATE UNIQUE INDEX IF NOT EXISTS voucher_active_source ON vouchers(client_id,source_type,source_id) WHERE source_id IS NOT NULL AND status='active';
+    CREATE INDEX IF NOT EXISTS voucher_period ON vouchers(client_id,period,status);
+    CREATE TABLE IF NOT EXISTS voucher_lines(id INTEGER PRIMARY KEY,voucher_id INTEGER NOT NULL REFERENCES vouchers(id) ON DELETE CASCADE,client_id INTEGER NOT NULL,account_code TEXT NOT NULL,debit_fen INTEGER NOT NULL DEFAULT 0 CHECK(debit_fen>=0),credit_fen INTEGER NOT NULL DEFAULT 0 CHECK(credit_fen>=0),cashflow_category TEXT NOT NULL DEFAULT 'unclassified',FOREIGN KEY(client_id,account_code) REFERENCES accounts(client_id,code));
+    CREATE INDEX IF NOT EXISTS voucher_line_account ON voucher_lines(client_id,account_code,voucher_id);
+    CREATE TABLE IF NOT EXISTS book_periods(client_id INTEGER NOT NULL REFERENCES clients(id),period TEXT NOT NULL,closed INTEGER NOT NULL DEFAULT 0,version INTEGER NOT NULL DEFAULT 1,closed_at TEXT,closed_by INTEGER REFERENCES users(id),closing_voucher_id INTEGER REFERENCES vouchers(id),PRIMARY KEY(client_id,period));
+    CREATE TABLE IF NOT EXISTS assets(id INTEGER PRIMARY KEY,client_id INTEGER NOT NULL REFERENCES clients(id),name TEXT NOT NULL,purchase_date TEXT NOT NULL,start_period TEXT NOT NULL,cost_fen INTEGER NOT NULL,residual_fen INTEGER NOT NULL,life_months INTEGER NOT NULL,expense_account TEXT NOT NULL,asset_account TEXT NOT NULL,depreciation_account TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'active',purchase_voucher_id INTEGER REFERENCES vouchers(id),disposal_voucher_id INTEGER REFERENCES vouchers(id),disposal_date TEXT,version INTEGER NOT NULL DEFAULT 1);
+    CREATE TABLE IF NOT EXISTS asset_depreciations(id INTEGER PRIMARY KEY,asset_id INTEGER NOT NULL REFERENCES assets(id),period TEXT NOT NULL,amount_fen INTEGER NOT NULL,voucher_id INTEGER REFERENCES vouchers(id),UNIQUE(asset_id,period));
+    CREATE TABLE IF NOT EXISTS inventory_items(id INTEGER PRIMARY KEY,client_id INTEGER NOT NULL REFERENCES clients(id),sku TEXT NOT NULL,name TEXT NOT NULL,unit TEXT NOT NULL,inventory_account TEXT NOT NULL,cost_account TEXT NOT NULL,quantity TEXT NOT NULL DEFAULT '0',value_fen INTEGER NOT NULL DEFAULT 0,version INTEGER NOT NULL DEFAULT 1,UNIQUE(client_id,sku));
+    CREATE TABLE IF NOT EXISTS inventory_movements(id INTEGER PRIMARY KEY,client_id INTEGER NOT NULL REFERENCES clients(id),item_id INTEGER NOT NULL REFERENCES inventory_items(id),date TEXT NOT NULL,direction TEXT NOT NULL,quantity TEXT NOT NULL,amount_fen INTEGER NOT NULL,voucher_id INTEGER REFERENCES vouchers(id),status TEXT NOT NULL DEFAULT 'active',created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS payroll(id INTEGER PRIMARY KEY,client_id INTEGER NOT NULL REFERENCES clients(id),period TEXT NOT NULL,employee_name TEXT NOT NULL,gross_fen INTEGER NOT NULL,withheld_tax_fen INTEGER NOT NULL DEFAULT 0,social_fen INTEGER NOT NULL DEFAULT 0,other_deduction_fen INTEGER NOT NULL DEFAULT 0,net_fen INTEGER NOT NULL,expense_account TEXT NOT NULL,voucher_id INTEGER REFERENCES vouchers(id),payment_voucher_id INTEGER REFERENCES vouchers(id),version INTEGER NOT NULL DEFAULT 1,UNIQUE(client_id,period,employee_name));
+    CREATE TABLE IF NOT EXISTS journals(id INTEGER PRIMARY KEY,client_id INTEGER NOT NULL REFERENCES clients(id),date TEXT NOT NULL,period TEXT NOT NULL,summary TEXT NOT NULL,bank_account TEXT NOT NULL,counter_account TEXT NOT NULL,direction TEXT NOT NULL,amount_fen INTEGER NOT NULL,cashflow_category TEXT NOT NULL DEFAULT 'unclassified',fingerprint TEXT NOT NULL,voucher_id INTEGER REFERENCES vouchers(id),version INTEGER NOT NULL DEFAULT 1,UNIQUE(client_id,fingerprint));
+    ''')
+    if 'status' not in {x[1] for x in conn.execute('PRAGMA table_info(inventory_movements)')}:
+        conn.execute("ALTER TABLE inventory_movements ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
+    if 'opening_period' not in {x[1] for x in conn.execute('PRAGMA table_info(book_settings)')}:
+        conn.execute('ALTER TABLE book_settings ADD COLUMN opening_period TEXT')
+    # Additive migrations keep existing vouchers, line ids and audit history intact.
+    if 'attachment_count' not in {x[1] for x in conn.execute('PRAGMA table_info(vouchers)')}:
+        conn.execute('ALTER TABLE vouchers ADD COLUMN attachment_count INTEGER NOT NULL DEFAULT 0 CHECK(attachment_count>=0 AND attachment_count<=9999)')
+    if 'summary' not in {x[1] for x in conn.execute('PRAGMA table_info(voucher_lines)')}:
+        conn.execute("ALTER TABLE voucher_lines ADD COLUMN summary TEXT NOT NULL DEFAULT ''")
+    # Retain legacy nonnegative storage for integrations while exposing the
+    # original signed sides to every ledger/report. Existing row IDs stay intact.
+    line_columns={x[1] for x in conn.execute('PRAGMA table_info(voucher_lines)')}
+    for column in ('original_debit_fen','original_credit_fen'):
+        if column not in line_columns:
+            conn.execute('ALTER TABLE voucher_lines ADD COLUMN '+column+' INTEGER')
+    conn.executescript('''
+    CREATE VIEW IF NOT EXISTS accounting_voucher_lines AS
+      SELECT id,voucher_id,client_id,account_code,
+             COALESCE(original_debit_fen,debit_fen) debit_fen,
+             COALESCE(original_credit_fen,credit_fen) credit_fen,
+             cashflow_category,summary FROM voucher_lines;
+    CREATE TRIGGER IF NOT EXISTS voucher_signed_insert BEFORE INSERT ON voucher_lines
+    WHEN (NEW.original_debit_fen IS NULL)<>(NEW.original_credit_fen IS NULL)
+      OR (NEW.original_debit_fen IS NOT NULL AND (
+          typeof(NEW.original_debit_fen)<>'integer' OR typeof(NEW.original_credit_fen)<>'integer'
+          OR abs(NEW.original_debit_fen)>900000000000000 OR abs(NEW.original_credit_fen)>900000000000000
+          OR (NEW.original_debit_fen<>0)=(NEW.original_credit_fen<>0)
+          OR NEW.original_debit_fen-NEW.original_credit_fen<>NEW.debit_fen-NEW.credit_fen))
+    BEGIN SELECT RAISE(ABORT,'Invalid original signed voucher amounts'); END;
+    CREATE TRIGGER IF NOT EXISTS voucher_signed_update BEFORE UPDATE ON voucher_lines
+    WHEN (NEW.original_debit_fen IS NULL)<>(NEW.original_credit_fen IS NULL)
+      OR (NEW.original_debit_fen IS NOT NULL AND (
+          typeof(NEW.original_debit_fen)<>'integer' OR typeof(NEW.original_credit_fen)<>'integer'
+          OR abs(NEW.original_debit_fen)>900000000000000 OR abs(NEW.original_credit_fen)>900000000000000
+          OR (NEW.original_debit_fen<>0)=(NEW.original_credit_fen<>0)
+          OR NEW.original_debit_fen-NEW.original_credit_fen<>NEW.debit_fen-NEW.credit_fen))
+    BEGIN SELECT RAISE(ABORT,'Invalid original signed voucher amounts'); END;
+    CREATE TABLE IF NOT EXISTS account_name_aliases(
+      client_id INTEGER NOT NULL,account_code TEXT NOT NULL,source_name TEXT NOT NULL,
+      local_name TEXT NOT NULL,source TEXT NOT NULL,
+      PRIMARY KEY(client_id,account_code,source_name),
+      FOREIGN KEY(client_id,account_code) REFERENCES accounts(client_id,code));
+    ''')
+    if 'counterparty' not in {x[1] for x in conn.execute('PRAGMA table_info(vouchers)')}:
+        conn.execute("ALTER TABLE vouchers ADD COLUMN counterparty TEXT NOT NULL DEFAULT ''")
+    if 'voucher_word' not in {x[1] for x in conn.execute('PRAGMA table_info(vouchers)')}:
+        conn.execute("ALTER TABLE vouchers ADD COLUMN voucher_word TEXT NOT NULL DEFAULT '记'")
+    payroll_columns={x[1] for x in conn.execute('PRAGMA table_info(payroll)')}
+    for column in ('employee_code','department','position','note'):
+        if column not in payroll_columns:
+            conn.execute('ALTER TABLE payroll ADD COLUMN '+column+" TEXT NOT NULL DEFAULT ''")
+    for column in ('pension_fen','medical_fen','unemployment_fen','housing_fund_fen'):
+        if column not in payroll_columns:
+            conn.execute(f'ALTER TABLE payroll ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0 CHECK({column}>=0)')
+    conn.executescript('''
+    CREATE TABLE IF NOT EXISTS voucher_attachments(voucher_id INTEGER NOT NULL REFERENCES vouchers(id),file_id INTEGER NOT NULL REFERENCES files(id),PRIMARY KEY(voucher_id,file_id));
+    CREATE TABLE IF NOT EXISTS voucher_templates(id INTEGER PRIMARY KEY,client_id INTEGER NOT NULL REFERENCES clients(id),name TEXT NOT NULL,summary TEXT NOT NULL,lines_json TEXT NOT NULL,voucher_word TEXT NOT NULL DEFAULT '记',version INTEGER NOT NULL DEFAULT 1,created_at TEXT NOT NULL,UNIQUE(client_id,name));
+    ''')
+
+
+def ensure_book(conn, client):
+    client = dict(client)
+    if conn.execute('SELECT 1 FROM accounts WHERE client_id=? LIMIT 1',(client['id'],)).fetchone():
+        return
+    conn.executemany('INSERT INTO accounts(client_id,code,name,direction,category,report_key) VALUES(?,?,?,?,?,?)',
+                     [(client['id'],)+row for row in _template(client['standard'])])
+    conn.execute('INSERT OR IGNORE INTO book_settings(client_id) VALUES(?)',(client['id'],))
+
+
+def apply_subject_list_to_book(conn, cid, expected_name, user=None):
+    """Apply the supplied 68-item list only to a specified, unchanged small book.
+
+    Refuse customized or already changed records rather than overwrite them. Caller
+    controls the transaction. Repeat runs are harmless. No vouchers are changed.
+    """
+    client = conn.execute('SELECT id,name,standard FROM clients WHERE id=? AND deleted=0',(cid,)).fetchone()
+    if not client or client['name'] != expected_name or client['standard'] != 'small2013':
+        raise ApiError(409,'账套身份或会计制度不匹配，未修改科目')
+    existing = {row['code']:dict(row) for row in conn.execute('SELECT * FROM accounts WHERE client_id=?',(cid,))}
+    expected = {row[0]:row[1:] for row in _legacy_template('small2013')}
+    additions = {'1133':('应收出口退税款','debit','asset','receivable'),
+                 '5901':('以前年度损益调整','debit','expense','prior_adjustment')}
+    if set(existing) - (set(expected) | set(additions)):
+        raise ApiError(409,'账套包含清单外科目，未自动覆盖')
+    for code, values in expected.items():
+        row=existing.get(code)
+        if not row:
+            raise ApiError(409,f'账套缺少原有科目 {code}，未自动覆盖')
+        actual=tuple(row[k] for k in ('name','direction','category','report_key'))
+        permitted = [values]
+        if code=='5403': permitted.append(('税金及附加',)+values[1:])
+        if actual not in permitted:
+            raise ApiError(409,f'科目 {code} 已被修改，未自动覆盖')
+    for code, values in additions.items():
+        row=existing.get(code)
+        if row and tuple(row[k] for k in ('name','direction','category','report_key')) != values:
+            raise ApiError(409,f'科目 {code} 已存在且内容不同，未自动覆盖')
+    if conn.execute("SELECT 1 FROM voucher_lines WHERE client_id=? AND account_code LIKE '5901%' LIMIT 1",(cid,)).fetchone():
+        raise ApiError(409,'以前年度损益调整已有凭证引用，须先核对，未自动修改')
+    changed=[]
+    for code, values in additions.items():
+        if code not in existing:
+            conn.execute('INSERT INTO accounts(client_id,code,name,direction,category,report_key) VALUES(?,?,?,?,?,?)',(cid,code,*values))
+            changed.append(code)
+    if existing['5403']['name'] != '税金及附加':
+        conn.execute("UPDATE accounts SET name='税金及附加',version=version+1 WHERE client_id=? AND code='5403'",(cid,))
+        changed.append('5403')
+    if changed:
+        audit(conn,user,'apply_subject_list','book',cid,{'changed_codes':changed,'source':'科目清单.xlsx'})
+    return {'client_id':cid,'count':68,'changed_codes':changed}
+
+
+def reconcile_small_subject_template(conn, cid, apply=False, user=None):
+    """Preview or add missing small-book template accounts without changing existing rows.
+
+    A same-code customization or incompatible descendant is reported for review.
+    Caller controls the write transaction, including audit logging, when applying.
+    """
+    client = conn.execute('SELECT id,standard,deleted FROM clients WHERE id=?',(cid,)).fetchone()
+    if not client or client['deleted'] or client['standard'] != 'small2013':
+        raise ApiError(409,'仅支持未删除的小企业会计准则账套')
+    existing = {row['code']:dict(row) for row in conn.execute('SELECT * FROM accounts WHERE client_id=?',(cid,))}
+    additions, conflicts = [], []
+    for code, name, direction, category, report_key in _template('small2013'):
+        row = existing.get(code)
+        expected = (name,direction,category,report_key)
+        if row:
+            actual = tuple(row[k] for k in ('name','direction','category','report_key'))
+            if actual != expected:
+                conflicts.append({'code':code,'reason':'已有科目内容不同，保留原内容'})
+            continue
+        descendants = [r for child,r in existing.items() if child.startswith(code) and child != code]
+        if any(tuple(r[k] for k in ('direction','category','report_key')) != (direction,category,report_key) for r in descendants):
+            conflicts.append({'code':code,'reason':'现有明细科目的方向或归类与模板不一致'})
+            continue
+        additions.append((code,name,direction,category,report_key))
+    if apply and additions:
+        conn.executemany('INSERT INTO accounts(client_id,code,name,direction,category,report_key) VALUES(?,?,?,?,?,?)',
+                         [(cid,)+row for row in additions])
+        audit(conn,user,'reconcile_small_subject_template','book',cid,
+              {'added_codes':[row[0] for row in additions],'conflicts':conflicts})
+    return {'client_id':cid,'existing_count':len(existing),'added_codes':[row[0] for row in additions],
+            'conflicts':conflicts,'applied':bool(apply)}
+
+
+@contextmanager
+def _write(conn):
+    with conn:
+        if not conn.in_transaction:
+            conn.execute('BEGIN IMMEDIATE')
+        yield
+
+
+def _period(value):
+    if not isinstance(value,str) or not re.fullmatch(r'\d{4}-\d{2}',value):
+        raise ApiError(400,'会计期间必须为 YYYY-MM')
+    try:
+        dt.date.fromisoformat(value+'-01')
+    except ValueError:
+        raise ApiError(400,'会计期间无效')
+    return value
+
+
+def _date(value):
+    if not isinstance(value,str) or not re.fullmatch(r'\d{4}-\d{2}-\d{2}',value):
+        raise ApiError(400,'日期必须为 YYYY-MM-DD')
+    try:
+        dt.date.fromisoformat(value)
+    except ValueError:
+        raise ApiError(400,'日期无效')
+    return value
+
+
+def _expense_date(invoice,transaction,saved=None):
+    """Prefer the document date; retain an explicit fallback for old records."""
+    for source,row in (('invoice',invoice),('transaction',transaction),('classification',saved)):
+        if not isinstance(row,dict): continue
+        try: return _date(row.get('date')),source
+        except ApiError: pass
+    return '', ''
+
+
+def _month_add(period,n):
+    y,m=map(int,period.split('-')); z=y*12+m-1+n
+    return f'{z//12:04d}-{z%12+1:02d}'
+
+
+def _last_date(period):
+    y,m=map(int,period.split('-'))
+    return f'{period}-{calendar.monthrange(y,m)[1]:02d}'
+
+
+def _text(value,name,maximum=200):
+    if not isinstance(value,str) or not value.strip() or len(value.strip())>maximum:
+        raise ApiError(400,f'{name}必填且不能超过{maximum}字')
+    return value.strip()
+
+
+def _positive(value):
+    value=amount(value)
+    if value==0:
+        raise ApiError(400,'金额必须大于零')
+    return value
+
+
+def _quantity(value):
+    if not isinstance(value,str) or not re.fullmatch(r'\d{1,15}(?:\.\d{1,6})?',value):
+        raise ApiError(400,'数量须为最多6位小数的正数字符串')
+    try:
+        q=Decimal(value)
+    except InvalidOperation:
+        raise ApiError(400,'数量无效')
+    if q<=0:
+        raise ApiError(400,'数量必须大于零')
+    return q
+
+
+def _version(row,payload):
+    if type(payload.get('version')) is not int or payload['version']!=row['version']:
+        raise ApiError(409,'数据已被修改，请刷新后重试',{'current_version':row['version']})
+
+
+def _client(conn,cid):
+    row=conn.execute('SELECT * FROM clients WHERE id=? AND deleted=0',(cid,)).fetchone()
+    if not row:
+        raise ApiError(404,'账套不存在或已回收')
+    if not row['enabled']:
+        raise ApiError(409,'账套已停用')
+    client=expand_client(row)
+    setting=conn.execute('SELECT opening_period FROM book_settings WHERE client_id=?',(cid,)).fetchone()
+    client['opening_period']=(setting[0] if setting else None) or client['start_period']
+    return client
+
+
+def _open(conn,cid,period):
+    _period(period)
+    c=_client(conn,cid)
+    if period<c['start_period']:
+        raise ApiError(409,'不能在建账月份之前记账')
+    if period<c['opening_period']:
+        raise ApiError(409,f'该账套从 {c["opening_period"]} 衔接期初，此前业务已包含在期初余额中')
+    closed=conn.execute('SELECT period FROM book_periods WHERE client_id=? AND closed=1 AND period>=? ORDER BY period LIMIT 1',(cid,period)).fetchone()
+    if closed:
+        raise ApiError(409,f'{closed["period"]}已结账，须按最近月份起依次反结账后操作')
+    return c
+
+
+def _account(conn,cid,code):
+    row=conn.execute('SELECT * FROM accounts WHERE client_id=? AND code=?',(cid,str(code))).fetchone()
+    if not row:
+        raise ApiError(400,f'科目不存在：{code}')
+    return dict(row)
+
+
+def _cash(account):
+    return account['report_key']=='cash'
+
+
+def account_name_matches(conn,cid,code,local_name,source_name):
+    """Only documented aliases bound to a standard/code or an individual book."""
+    import unicodedata
+    def key(value):
+        return re.sub(r'\s+','',unicodedata.normalize('NFKC',str(value)))
+    if key(local_name)==key(source_name): return True
+    standard=conn.execute('SELECT standard FROM clients WHERE id=?',(cid,)).fetchone()[0]
+    if code==('5403' if standard=='small2013' else '6403'):
+        if {key(local_name),key(source_name)}=={'税金及附加','营业税金及附加'}: return True
+    return any(key(row['source_name'])==key(source_name) and key(row['local_name'])==key(local_name)
+               for row in conn.execute('SELECT source_name,local_name FROM account_name_aliases WHERE client_id=? AND account_code=?',(cid,code)))
+
+
+def _signed_amount(value):
+    if type(value) is not int or abs(value)>900000000000000:
+        raise ApiError(400,'金额须为有效的整数分，红字填写负数')
+    return value
+
+
+def _store_voucher_lines(conn,cid,vid,lines,summary):
+    conn.executemany('''INSERT INTO voucher_lines
+        (voucher_id,client_id,account_code,debit_fen,credit_fen,cashflow_category,summary,original_debit_fen,original_credit_fen)
+        VALUES(?,?,?,?,?,?,?,?,?)''',
+        [(vid,cid,x['account_code'],max(x['debit_fen']-x['credit_fen'],0),max(x['credit_fen']-x['debit_fen'],0),
+          x['cashflow_category'],x['summary'] or summary,
+          x['debit_fen'] if min(x['debit_fen'],x['credit_fen'])<0 else None,
+          x['credit_fen'] if min(x['debit_fen'],x['credit_fen'])<0 else None) for x in lines])
+
+
+RECONCILIATION_VOUCHER_SOURCES = frozenset(('reconciliation','bank_receipt','bank_statement','reconciliation_invoice'))
+
+
+def account_category_summary(conn,cid,line):
+    """Use the book's own top-level subject, including unresolved detail drafts."""
+    code=str(line.get('account_code') or line.get('business_parent_code') or line.get('counterparty_parent_code') or '')
+    account=conn.execute('''SELECT name FROM accounts WHERE client_id=?
+        AND substr(?,1,length(code))=code ORDER BY length(code),code LIMIT 1''',(cid,code)).fetchone()
+    return str(account['name'] if account else line.get('account_name') or '')[:200]
+
+
+def with_account_summaries(conn,cid,lines):
+    return [dict(line,summary=account_category_summary(conn,cid,line)) for line in lines]
+
+
+def _cash_net(lines):
+    return sum(line['debit_fen']-line['credit_fen'] for line in lines if line['is_cash'])
+
+
+def _lines(conn,cid,lines):
+    if not isinstance(lines,list) or not 2<=len(lines)<=500:
+        raise ApiError(400,'凭证需要2至500条分录')
+    validated=[]; cashnet=0
+    for line in lines:
+        if not isinstance(line,dict):
+            raise ApiError(400,'凭证分录格式错误')
+        a=_account(conn,cid,line.get('account_code',''))
+        if a['report_key']=='prior_adjustment':
+            raise ApiError(409,'以前年度损益调整科目暂不支持记账，请勿作为本期损益处理')
+        # A parent cannot be posted once it has subaccounts.
+        if conn.execute('SELECT 1 FROM accounts WHERE client_id=? AND code LIKE ? AND code<>? LIMIT 1',(cid,a['code']+'%',a['code'])).fetchone():
+            raise ApiError(400,f'请选末级科目：{a["code"]}')
+        debit=_signed_amount(line.get('debit_fen',0)); credit=_signed_amount(line.get('credit_fen',0))
+        if bool(debit)==bool(credit):
+            raise ApiError(400,'每条分录只能借方或贷方一侧有金额，红字填写负数')
+        cat=line.get('cashflow_category') or 'unclassified'
+        if cat not in CASH_CATEGORIES:
+            raise ApiError(400,'现金流分类无效')
+        if _cash(a):
+            cashnet+=debit-credit
+        summary=line.get('summary','')
+        if not isinstance(summary,str) or len(summary.strip())>200:
+            raise ApiError(400,'分录摘要须为不超过200字的文本')
+        validated.append({'account_code':a['code'],'debit_fen':debit,'credit_fen':credit,
+                          'cashflow_category':cat,'is_cash':_cash(a),'summary':summary.strip()})
+    if sum(x['debit_fen'] for x in validated)!=sum(x['credit_fen'] for x in validated):
+        raise ApiError(400,'借贷不平衡，凭证未保存')
+    if any(x['is_cash'] and x['cashflow_category']=='transfer' for x in validated):
+        if cashnet or any(not x['is_cash'] or x['cashflow_category']!='transfer' for x in validated):
+            raise ApiError(400,'内部转账只能包含同张凭证内净额为零且全部标为转账的货币资金分录')
+    return validated
+
+
+def _attachment_count(value):
+    if type(value) is not int or not 0<=value<=9999:
+        raise ApiError(400,'附件张数须为0至9999的整数')
+    return value
+
+
+def _insert_voucher(conn,cid,date,summary,lines,user,source_type='manual',source_id=None,reviewed=False,attachment_count=0,counterparty=''):
+    _date(date); _open(conn,cid,date[:7]); summary=_text(summary,'摘要')
+    lines=_lines(conn,cid,lines); attachment_count=_attachment_count(attachment_count)
+    if source_id is not None:
+        existing=conn.execute("SELECT id FROM vouchers WHERE client_id=? AND source_type=? AND source_id=? AND status='active'",(cid,source_type,str(source_id))).fetchone()
+        if existing:
+            raise ApiError(409,'该业务已生成凭证',{'voucher_id':existing['id']})
+    number=conn.execute('SELECT COALESCE(MAX(number),0)+1 FROM vouchers WHERE client_id=? AND period=?',(cid,date[:7])).fetchone()[0]
+    uid=(user or {}).get('id')
+    cur=conn.execute('INSERT INTO vouchers(client_id,date,period,number,summary,source_type,source_id,reviewed,reviewed_by,reviewed_at,created_at,created_by,attachment_count,counterparty) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        (cid,date,date[:7],number,summary,source_type,str(source_id) if source_id is not None else None,int(reviewed),uid if reviewed else None,now() if reviewed else None,now(),uid,attachment_count,str(counterparty or '').strip()[:200]))
+    vid=cur.lastrowid
+    _store_voucher_lines(conn,cid,vid,lines,summary)
+    conn.execute('INSERT OR IGNORE INTO book_periods(client_id,period) VALUES(?,?)',(cid,date[:7]))
+    audit(conn,user,'create','voucher',vid,{'client_id':cid,'source_type':source_type,'source_id':source_id,'summary':summary,'attachment_count':attachment_count,'lines':lines})
+    return vid
+
+
+def _entry(code,debit=0,credit=0,category='unclassified'):
+    return {'account_code':code,'debit_fen':debit,'credit_fen':credit,'cashflow_category':category}
+
+
+def create_invoice_voucher(conn,invoice,payload,user):
+    """Caller owns transaction; returns voucher_id. No tax rate is inferred."""
+    invoice=dict(invoice); cid=invoice['client_id']
+    if invoice.get('status')=='posted' or invoice.get('voucher_id'):
+        raise ApiError(409,'发票已生成凭证')
+    if conn.execute("SELECT 1 FROM vouchers WHERE client_id=? AND source_type='reconciliation_invoice' AND source_id=? AND status='active'",(cid,invoice['number'])).fetchone():
+        raise ApiError(409,'该发票已在流水及发票原件中生成凭证')
+    debit=payload.get('debit_account'); credit=payload.get('credit_account')
+    _account(conn,cid,debit); _account(conn,cid,credit)
+    total=amount(invoice['total_fen']); net=amount(invoice['amount_fen']); tax=amount(invoice['tax_fen'])
+    if total!=net+tax or total<=0:
+        raise ApiError(400,'发票价税合计无效')
+    cashcat=payload.get('cashflow_category','unclassified')
+    if invoice['kind']=='output':
+        lines=[_entry(debit,total,category=cashcat)]
+        if net: lines.append(_entry(credit,credit=net))
+        if tax:
+            ta=payload.get('tax_account')
+            if not ta: raise ApiError(400,'有税额时须明确选择应交税费科目')
+            lines.append(_entry(ta,credit=tax))
+    else:
+        lines=[_entry(credit,credit=total,category=cashcat)]
+        if tax and payload.get('tax_account'):
+            if net: lines.append(_entry(debit,net))
+            lines.append(_entry(payload['tax_account'],tax))
+        else:
+            lines.append(_entry(debit,total))
+    return _insert_voucher(conn,cid,invoice['date'],invoice.get('summary') or f'发票 {invoice["number"]}',lines,user,'invoice',invoice['id'])
+
+
+def create_bank_journal(conn,client_id,row,user):
+    """Full validation without commit so imports are all-or-nothing."""
+    cid=int(client_id); date=_date(row.get('date')); _open(conn,cid,date[:7])
+    summary=_text(row.get('summary'),'摘要')
+    bank=_account(conn,cid,row.get('bank_account')); counter=_account(conn,cid,row.get('counter_account'))
+    if not _cash(bank): raise ApiError(400,'银行/现金账户须为货币资金科目')
+    if bank['code']==counter['code']: raise ApiError(400,'收付账户与对方科目不能相同')
+    direction=row.get('direction')
+    if direction not in ('income','expense'): raise ApiError(400,'收支方向无效')
+    cashcat=row.get('cashflow_category') or 'unclassified'
+    if cashcat not in CASH_CATEGORIES: raise ApiError(400,'现金流分类无效')
+    if cashcat=='transfer' and not _cash(counter): raise ApiError(400,'转账的对方也须为货币资金科目')
+    value=_positive(row.get('amount_fen'))
+    fingerprint=hashlib.sha256(json.dumps([date,summary,bank['code'],counter['code'],direction,value],ensure_ascii=False).encode()).hexdigest()
+    if conn.execute('SELECT 1 FROM journals WHERE client_id=? AND fingerprint=?',(cid,fingerprint)).fetchone():
+        raise ApiError(409,'相同银行日记账已存在，请核实重复导入')
+    cur=conn.execute('INSERT INTO journals(client_id,date,period,summary,bank_account,counter_account,direction,amount_fen,cashflow_category,fingerprint) VALUES(?,?,?,?,?,?,?,?,?,?)',
+        (cid,date,date[:7],summary,bank['code'],counter['code'],direction,value,cashcat,fingerprint))
+    audit(conn,user,'create','journal',cur.lastrowid,{'client_id':cid,'date':date,'amount_fen':value,'source':row.get('source','manual')})
+    return dict(conn.execute('SELECT * FROM journals WHERE id=?',(cur.lastrowid,)).fetchone())
+
+
+def _voucher(conn,cid,vid):
+    row=conn.execute('SELECT v.*,u.name created_by_name FROM vouchers v LEFT JOIN users u ON u.id=v.created_by WHERE v.id=? AND v.client_id=?',(vid,cid)).fetchone()
+    if not row: raise ApiError(404,'凭证不存在')
+    d=dict(row)
+    d['lines']=[dict(x) for x in conn.execute('SELECT l.*,a.name account_name FROM accounting_voucher_lines l JOIN accounts a ON a.client_id=l.client_id AND a.code=l.account_code WHERE voucher_id=? ORDER BY l.id',(vid,))]
+    d['attachments']=[dict(x) for x in conn.execute('SELECT f.id,f.name,f.size FROM voucher_attachments va JOIN files f ON f.id=va.file_id WHERE va.voucher_id=? ORDER BY f.id',(vid,))]
+    return d
+
+
+def _voucher_extras(conn,cid,vid,payload,user):
+    word=payload.get('voucher_word','记')
+    if word not in ('记','收','付','转'): raise ApiError(400,'凭证字无效')
+    conn.execute('UPDATE vouchers SET voucher_word=? WHERE id=? AND client_id=?',(word,vid,cid))
+    if 'attachment_ids' not in payload: return
+    ids=payload['attachment_ids']
+    if not isinstance(ids,list) or len(ids)>30 or any(type(i) is not int or i<1 for i in ids) or len(set(ids))!=len(ids):
+        raise ApiError(400,'请提供最多30份不重复的附件')
+    for ident in ids:
+        file=conn.execute('SELECT * FROM files WHERE id=?',(ident,)).fetchone()
+        existing=conn.execute('SELECT v.client_id FROM voucher_attachments va JOIN vouchers v ON v.id=va.voucher_id WHERE va.file_id=?',(ident,)).fetchall()
+        if not file or conn.execute('SELECT 1 FROM source_archive_files WHERE file_id=?',(ident,)).fetchone():
+            raise ApiError(400,'附件不存在或须通过原件归档入口关联')
+        if any(x['client_id']!=cid for x in existing) or (not existing and file['user_id']!=(user or {}).get('id')):
+            raise ApiError(403,'附件不属于当前账套或操作员')
+    before=[x[0] for x in conn.execute('SELECT file_id FROM voucher_attachments WHERE voucher_id=?',(vid,))]
+    conn.execute('DELETE FROM voucher_attachments WHERE voucher_id=?',(vid,))
+    conn.executemany('INSERT INTO voucher_attachments(voucher_id,file_id) VALUES(?,?)',[(vid,i) for i in ids])
+    if before!=ids: audit(conn,user,'attachments','voucher',vid,{'client_id':cid,'before':before,'after':ids})
+
+
+def withdraw_source(conn,cid,vid,user,reason,version):
+    """Undo an unreviewed, open-period source posting, preserving audit/voucher.
+
+    No commit: the HTTP route and any calling invoice route own the transaction.
+    Dependent subledger postings must be withdrawn newest-first.
+    """
+    reason=_text(reason,'撤回原因',500); row=_voucher(conn,cid,vid)
+    _version(row,{'version':version}); _open(conn,cid,row['period'])
+    if row['status']!='active': raise ApiError(409,'凭证已作废')
+    if row['reviewed']: raise ApiError(409,'须先取消凭证审核，再撤回来源业务')
+    source=row['source_type']; sid=row['source_id']; before=None
+    if source=='invoice':
+        record=conn.execute('SELECT * FROM invoices WHERE client_id=? AND id=? AND voucher_id=?',(cid,sid,vid)).fetchone()
+        if not record: raise ApiError(409,'发票与凭证关联不一致，不能撤回')
+        before=dict(record)
+        conn.execute("UPDATE invoices SET status='unprocessed',voucher_id=NULL,version=version+1,updated_at=? WHERE id=?",(now(),record['id']))
+    elif source=='reconciliation':
+        record=conn.execute('SELECT * FROM reconciliation_records WHERE client_id=? AND id=?',(cid,sid)).fetchone()
+        if not record: raise ApiError(409,'核对记录与凭证关联不一致，不能撤回')
+        before=dict(record)
+    elif source=='bank':
+        record=conn.execute('SELECT * FROM journals WHERE client_id=? AND id=? AND voucher_id=?',(cid,sid,vid)).fetchone()
+        if not record: raise ApiError(409,'日记账与凭证关联不一致')
+        before=dict(record); conn.execute('UPDATE journals SET voucher_id=NULL,version=version+1 WHERE id=?',(record['id'],))
+    elif source=='inventory':
+        record=conn.execute("SELECT * FROM inventory_movements WHERE client_id=? AND id=? AND voucher_id=? AND status='active'",(cid,sid,vid)).fetchone()
+        if not record: raise ApiError(409,'库存流水与凭证关联不一致')
+        latest=conn.execute("SELECT MAX(id) FROM inventory_movements WHERE item_id=? AND status='active'",(record['item_id'],)).fetchone()[0]
+        if latest!=record['id']: raise ApiError(409,'存货成本已有后续依赖，须从该商品最近流水起逐笔撤回')
+        item=conn.execute('SELECT * FROM inventory_items WHERE id=?',(record['item_id'],)).fetchone()
+        sign=1 if record['direction']=='in' else -1
+        qty=Decimal(item['quantity'])-Decimal(record['quantity'])*sign
+        value=item['value_fen']-record['amount_fen']*sign
+        if qty<0 or value<0: raise ApiError(409,'回滚库存将出现负数，不能撤回')
+        before={'movement':dict(record),'item':dict(item)}
+        conn.execute("UPDATE inventory_movements SET status='void' WHERE id=?",(record['id'],))
+        conn.execute('UPDATE inventory_items SET quantity=?,value_fen=?,version=version+1 WHERE id=?',(format(qty,'f'),value,item['id']))
+    elif source=='asset_purchase':
+        record=conn.execute('SELECT * FROM assets WHERE client_id=? AND id=? AND purchase_voucher_id=?',(cid,sid,vid)).fetchone()
+        if not record or record['status']!='active': raise ApiError(409,'资产购置状态不允许撤回')
+        if conn.execute('SELECT 1 FROM asset_depreciations WHERE asset_id=?',(record['id'],)).fetchone() or record['disposal_voucher_id']:
+            raise ApiError(409,'该资产已有折旧或处置，请先从最近来源业务起撤回')
+        before=dict(record); conn.execute("UPDATE assets SET status='cancelled',version=version+1 WHERE id=?",(record['id'],))
+    elif source=='depreciation':
+        record=conn.execute('SELECT d.*,a.disposal_voucher_id,a.client_id FROM asset_depreciations d JOIN assets a ON a.id=d.asset_id WHERE d.voucher_id=? AND a.client_id=?',(vid,cid)).fetchone()
+        if not record: raise ApiError(409,'折旧与凭证关联不一致')
+        if record['disposal_voucher_id']: raise ApiError(409,'资产已处置，请先撤回处置')
+        if conn.execute('SELECT 1 FROM asset_depreciations WHERE asset_id=? AND period>?',(record['asset_id'],record['period'])).fetchone():
+            raise ApiError(409,'请从该资产最近折旧月份起撤回')
+        before=dict(record)
+        conn.execute('DELETE FROM asset_depreciations WHERE id=?',(record['id'],))
+        conn.execute('UPDATE assets SET version=version+1 WHERE id=?',(record['asset_id'],))
+    elif source=='asset_disposal':
+        record=conn.execute('SELECT * FROM assets WHERE client_id=? AND id=? AND disposal_voucher_id=?',(cid,sid,vid)).fetchone()
+        if not record or record['status']!='disposed': raise ApiError(409,'资产处置与凭证关联不一致')
+        before=dict(record)
+        conn.execute("UPDATE assets SET status='active',disposal_date=NULL,disposal_voucher_id=NULL,version=version+1 WHERE id=?",(record['id'],))
+    elif source=='payroll':
+        records=conn.execute('SELECT * FROM payroll WHERE client_id=? AND period=? AND voucher_id=?',(cid,sid,vid)).fetchall()
+        if not records: raise ApiError(409,'工资计提与凭证关联不一致')
+        if any(x['payment_voucher_id'] for x in records): raise ApiError(409,'该期工资已发放，请先撤回发放凭证')
+        before=[dict(x) for x in records]
+        conn.execute('UPDATE payroll SET voucher_id=NULL,version=version+1 WHERE client_id=? AND period=? AND voucher_id=?',(cid,sid,vid))
+    elif source=='payroll_payment':
+        records=conn.execute('SELECT * FROM payroll WHERE client_id=? AND period=? AND payment_voucher_id=?',(cid,sid,vid)).fetchall()
+        if not records: raise ApiError(409,'工资发放与凭证关联不一致')
+        before=[dict(x) for x in records]
+        conn.execute('UPDATE payroll SET payment_voucher_id=NULL,version=version+1 WHERE client_id=? AND period=? AND payment_voucher_id=?',(cid,sid,vid))
+    elif source=='bank_receipt':
+        # Receipt postings keep no source row; voiding frees the receipt for re-posting.
+        before={'receipt':sid}
+    elif source=='bank_statement':
+        # Confirmed statement lines keep no source row; voiding frees that transaction key.
+        before={'statement':sid}
+    elif source=='reconciliation_invoice':
+        before={'invoice_number':sid}
+    else:
+        raise ApiError(409,'该来源不能在此撤回；手工凭证使用作废，损益结转使用反结账')
+    conn.execute("UPDATE vouchers SET status='void',version=version+1 WHERE id=?",(vid,))
+    audit(conn,user,'withdraw_source','voucher',vid,{'reason':reason,'source_type':source,'source_id':sid,'source_before':before,'voucher_before':row})
+    return {'id':vid,'status':'void','source_type':source,'source_id':sid,'withdrawn':True,'version':row['version']+1}
+
+
+def _delete_reconciliation_record(conn,cid,rid,user,reason):
+    record=conn.execute('SELECT * FROM reconciliation_records WHERE client_id=? AND id=?',(cid,rid)).fetchone()
+    if not record: return
+    if conn.execute("SELECT 1 FROM vouchers WHERE client_id=? AND source_type='reconciliation' AND source_id=? AND status='active'",(cid,str(rid))).fetchone():
+        raise ApiError(409,'核对记录仍有有效凭证，请先删除凭证')
+    conn.execute('DELETE FROM reconciliation_records WHERE id=?',(rid,))
+    audit(conn,user,'delete','reconciliation_records',rid,{'reason':reason,'before':dict(record)})
+
+
+def delete_balance_entry(conn,cid,payload,user):
+    """Remove one wrongly saved balance-table entry; vouchers are voided, never erased."""
+    reason=_text(payload.get('reason'),'删除原因',500)
+    vid=payload.get('voucher_id'); rid=payload.get('record_id')
+    if type(vid) is int:
+        row=_voucher(conn,cid,vid); _open(conn,cid,row['period'])
+        if row['status']!='active': raise ApiError(409,'凭证已作废')
+        if row['reviewed']: raise ApiError(409,'已审核凭证须先取消审核')
+        source=row['source_type'] or 'manual'
+        if source=='closing': raise ApiError(409,'损益结转凭证请通过反结账撤销')
+        if source=='manual':
+            conn.execute("UPDATE vouchers SET status='void',version=version+1 WHERE id=?",(vid,))
+            audit(conn,user,'void','voucher',vid,{'before':row,'reason':reason})
+        else:
+            withdraw_source(conn,cid,vid,user,reason,row['version'])
+            if source=='reconciliation': _delete_reconciliation_record(conn,cid,int(row['source_id']),user,reason)
+        return {'voucher_id':vid,'status':'void'}
+    if type(rid) is int:
+        if not conn.execute('SELECT 1 FROM reconciliation_records WHERE client_id=? AND id=?',(cid,rid)).fetchone(): raise ApiError(404,'核对记录不存在')
+        _delete_reconciliation_record(conn,cid,rid,user,reason)
+        return {'record_id':rid,'status':'deleted'}
+    raise ApiError(400,'请指定要删除的凭证或核对记录')
+
+
+def _balance_delete_token(kind,row):
+    """Fingerprint a persisted source, never its derived balance presentation."""
+    if kind=='voucher':
+        source={'id':row['id'],'version':row['version']}
+    elif kind=='record':
+        source=dict(row)
+    else:
+        raise ValueError('Unknown balance deletion source')
+    canonical=json.dumps({'kind':kind,'source':source},ensure_ascii=False,sort_keys=True,separators=(',',':'))
+    return hashlib.sha256(canonical.encode('utf-8')).hexdigest()
+
+
+def delete_balance_entries(conn,cid,payload,user):
+    """Delete selected source entries in the route's single write transaction."""
+    if not isinstance(payload,dict): raise ApiError(400,'批量删除数据格式错误')
+    reason=_text(payload.get('reason'),'删除原因',500)
+    entries=payload.get('entries')
+    if not isinstance(entries,list) or not 1<=len(entries)<=5000:
+        raise ApiError(400,'请选择1至5000条数据进行删除')
+    voucher_tokens={}; record_tokens={}
+    changed='所选数据已变化，请刷新余额表后重新选择；本次未删除任何数据'
+    for entry in entries:
+        if not isinstance(entry,dict) or set(entry) not in ({'voucher_id','delete_token'},{'record_id','delete_token'}):
+            raise ApiError(400,'每条删除数据须指定凭证或核对记录及删除校验标记，请刷新余额表')
+        key='voucher_id' if 'voucher_id' in entry else 'record_id'; value=entry[key]
+        if type(value) is not int or not 0<value<=9223372036854775807:
+            raise ApiError(400,'删除数据编号须为有效正整数')
+        token=entry['delete_token']
+        if not isinstance(token,str) or not re.fullmatch(r'[0-9a-f]{64}',token):
+            raise ApiError(400,'删除校验标记无效，请刷新余额表')
+        tokens=voucher_tokens if key=='voucher_id' else record_tokens
+        if value in tokens and tokens[value]!=token: raise ApiError(409,changed)
+        tokens[value]=token
+    voucher_ids=set(voucher_tokens); record_ids=set(record_tokens)
+
+    # Validate every selected voucher before changing anything. The transaction
+    # also rolls back later source-dependency failures and their audit writes.
+    linked_records=set()
+    for vid in sorted(voucher_ids):
+        row=_voucher(conn,cid,vid)
+        if voucher_tokens[vid]!=_balance_delete_token('voucher',row): raise ApiError(409,changed)
+        _open(conn,cid,row['period'])
+        if row['status']!='active': raise ApiError(409,'凭证已作废')
+        if row['reviewed']: raise ApiError(409,'已审核凭证须先取消审核')
+        if row['source_type']=='closing': raise ApiError(409,'损益结转凭证请通过反结账撤销')
+        if row['source_type']=='reconciliation':
+            try: linked_records.add(int(row['source_id']))
+            except (TypeError,ValueError): raise ApiError(409,'核对记录与凭证关联不一致，不能删除')
+    for rid in sorted(record_ids):
+        record=conn.execute('SELECT * FROM reconciliation_records WHERE client_id=? AND id=?',(cid,rid)).fetchone()
+        if not record: raise ApiError(404,'核对记录不存在')
+        if record_tokens[rid]!=_balance_delete_token('record',record): raise ApiError(409,changed)
+        # One selected voucher already removes its linked reconciliation row.
+        if rid in linked_records: continue
+        if conn.execute("SELECT 1 FROM vouchers WHERE client_id=? AND source_type='reconciliation' AND source_id=? AND status='active'",(cid,str(rid))).fetchone():
+            raise ApiError(409,'核对记录仍有有效凭证，请同时选择对应凭证')
+        metadata=_balance_object(record['batch_metadata_json'])
+        date,_=_expense_date(_balance_object(record['invoice_json']),_balance_object(record['transaction_json']),metadata.get('expense_classification'))
+        if not date: raise ApiError(409,'核对记录日期缺失，不能批量删除，请先核对原始记录')
+        _open(conn,cid,date[:7])
+
+    results=[]
+    # Newest postings first respects inventory, payroll and asset dependencies.
+    # A dependency outside the selection still rejects the entire transaction.
+    for vid in sorted(voucher_ids,reverse=True):
+        results.append(delete_balance_entry(conn,cid,{'voucher_id':vid,'reason':reason},user))
+    for rid in sorted(record_ids-linked_records):
+        results.append(delete_balance_entry(conn,cid,{'record_id':rid,'reason':reason},user))
+    return {'deleted_count':len(results),'voucher_count':len(voucher_ids),
+            'record_count':len(record_ids-linked_records),'requested_count':len(entries),'results':results}
+
+
+def _trial(conn,cid,period):
+    return _trial_range(conn,cid,period,period)
+
+
+def _trial_range(conn,cid,start,end):
+    """Raw per-account values; parent display totals must never feed reports."""
+    client=_client(conn,cid)
+    if start<client['opening_period']:
+        raise ApiError(400,f'账务资料从 {client["opening_period"]} 开始，此前期间尚未导入')
+    accounts=[dict(a) for a in conn.execute('SELECT * FROM accounts WHERE client_id=? ORDER BY code',(cid,))]
+    opening={x['account_code']:x['debit_fen']-x['credit_fen'] for x in conn.execute('SELECT * FROM opening_balances WHERE client_id=?',(cid,))}
+    before={x['account_code']:x['balance'] for x in conn.execute("SELECT l.account_code,SUM(l.debit_fen-l.credit_fen) balance FROM accounting_voucher_lines l JOIN vouchers v ON v.id=l.voucher_id WHERE v.client_id=? AND v.status='active' AND v.period<? GROUP BY l.account_code",(cid,start))}
+    current={x['account_code']:(x['debit'],x['credit']) for x in conn.execute("SELECT l.account_code,SUM(l.debit_fen) debit,SUM(l.credit_fen) credit FROM accounting_voucher_lines l JOIN vouchers v ON v.id=l.voucher_id WHERE v.client_id=? AND v.status='active' AND v.period BETWEEN ? AND ? GROUP BY l.account_code",(cid,start,end))}
+    ytd={x['account_code']:(x['debit'],x['credit']) for x in conn.execute("SELECT l.account_code,SUM(l.debit_fen) debit,SUM(l.credit_fen) credit FROM accounting_voucher_lines l JOIN vouchers v ON v.id=l.voucher_id WHERE v.client_id=? AND v.status='active' AND v.period BETWEEN ? AND ? GROUP BY l.account_code",(cid,end[:4]+'-01',end))}
+    hierarchy={}
+    for a in accounts:
+        code=a['code']; parents=[p['code'] for p in accounts if len(p['code'])<len(code) and code.startswith(p['code'])]
+        parent=max(parents,key=len) if parents else None
+        hierarchy[code]={'parent_code':parent,'level':len(parents)+1,
+                         'is_leaf':not any(p['code']!=code and p['code'].startswith(code) for p in accounts)}
+    rows=[]
+    for a in accounts:
+        code=a['code']; begin=opening.get(code,0)+before.get(code,0); d,c=current.get(code,(0,0)); finish=begin+d-c; yd,yc=ytd.get(code,(0,0))
+        rows.append({'account_code':code,'account_name':a['name'],'category':a['category'],'direction':a['direction'],'report_key':a['report_key'],
+                     'opening_debit_fen':max(begin,0),'opening_credit_fen':max(-begin,0),'debit_fen':d,'credit_fen':c,
+                     'closing_debit_fen':max(finish,0),'closing_credit_fen':max(-finish,0),
+                     'ytd_debit_fen':yd,'ytd_credit_fen':yc,**hierarchy[code]})
+    return rows
+
+
+def _trial_rollup(trial):
+    """Display hierarchy including every descendant exactly once per ancestor."""
+    rows=[]
+    for row in trial:
+        children=[r for r in trial if r['account_code'].startswith(row['account_code'])]
+        begin=sum(r['opening_debit_fen']-r['opening_credit_fen'] for r in children)
+        end=sum(r['closing_debit_fen']-r['closing_credit_fen'] for r in children)
+        item=dict(row,opening_debit_fen=max(begin,0),opening_credit_fen=max(-begin,0),
+                  closing_debit_fen=max(end,0),closing_credit_fen=max(-end,0))
+        for key in ('debit_fen','credit_fen','ytd_debit_fen','ytd_credit_fen'):
+            item[key]=sum(r[key] for r in children)
+        rows.append(item)
+    return rows
+
+
+def _ledger(conn,cid,start,end,trial):
+    balances={x['account_code']:x['opening_debit_fen']-x['opening_credit_fen'] for x in trial}
+    result=[]
+    for row in conn.execute("SELECT l.*,l.summary line_summary,a.name account_name,v.date,v.number,v.summary voucher_summary FROM accounting_voucher_lines l JOIN vouchers v ON v.id=l.voucher_id JOIN accounts a ON a.client_id=l.client_id AND a.code=l.account_code WHERE v.client_id=? AND v.period BETWEEN ? AND ? AND v.status='active' ORDER BY v.date,v.number,l.id",(cid,start,end)):
+        x=dict(row); x['summary']=x['line_summary'] or x['voucher_summary']
+        balances[x['account_code']]+=x['debit_fen']-x['credit_fen']; x['balance_fen']=balances[x['account_code']]; result.append(x)
+    return result
+
+
+def _balance_object(value):
+    try:
+        result=json.loads(value or '{}')
+        return result if isinstance(result,dict) else {}
+    except (ValueError,TypeError): return {}
+
+
+def _balance_text(value):
+    return value.strip() if isinstance(value,str) else ''
+
+
+def _balance_contribution(date,start,end,debit,credit,initial=False):
+    """Amounts contributed by one item, not a running account balance.
+
+    Opening/closing contributions reconcile to account totals after netting
+    debit and credit. Keep individual opposite-side payments visible even when
+    their account's ending balance is zero.
+    """
+    before=initial or date[:7]<start
+    net=debit-credit
+    opening=net if before else 0
+    ytd=not initial and end[:4]+'-01'<=date[:7]<=end
+    return {'period_bucket':'opening' if before else 'current',
+            'opening_debit_fen':max(opening,0),'opening_credit_fen':max(-opening,0),
+            'debit_fen':0 if before else debit,'credit_fen':0 if before else credit,
+            'closing_debit_fen':max(net,0),'closing_credit_fen':max(-net,0),
+            'ytd_debit_fen':debit if ytd else 0,'ytd_credit_fen':credit if ytd else 0}
+
+
+def _balance_classifications(conn,cid,start,end,accounts):
+    classified=[]
+    for row in conn.execute("""SELECT r.*
+        FROM reconciliation_records r WHERE r.client_id=? AND r.status IN ('matched','reviewed') AND NOT EXISTS
+        (SELECT 1 FROM vouchers v WHERE v.client_id=r.client_id AND v.source_type='reconciliation'
+         AND v.source_id=CAST(r.id AS TEXT) AND v.status='active')""",(cid,)):
+        entry=_balance_object(row['batch_metadata_json']).get('expense_classification')
+        if (not isinstance(entry,dict) or entry.get('direction')!='expense' or
+            not isinstance(entry.get('account_code'),str) or entry['account_code'] not in accounts or
+            type(entry.get('amount_fen')) is not int or entry['amount_fen']<=0): continue
+        transaction=_balance_object(row['transaction_json']); invoice=_balance_object(row['invoice_json'])
+        date,date_source=_expense_date(invoice,transaction,entry)
+        if not date or date[:7]>end: continue
+        counterparty=_balance_text(transaction.get('counterparty'))
+        summary=(_balance_text(transaction.get('note')) or _balance_text(entry.get('summary')) or
+                 _balance_text(invoice.get('item_name')) or ('付款 '+counterparty).strip())
+        classified.append({**entry,'account_name':accounts[entry['account_code']]['account_name'],
+            'record_id':row['id'],'status':'expense_classified','counterparty':counterparty,
+            'date':date,'date_source':date_source,'summary':summary,
+            'invoice_number':row['invoice_number'],'source':_balance_text(entry.get('source')) or 'invoice_and_list',
+            'source_type':'expense_classification','source_id':str(row['id']),
+            'source_label':'发票支出','reference':'发票 '+row['invoice_number'],
+            'delete_token':_balance_delete_token('record',row),
+            **_balance_contribution(date,start,end,entry['amount_fen'],0)})
+    return sorted(classified,key=lambda x:(x['date'],x['record_id']))
+
+
+def _balance_details(conn,cid,client,start,end,classified):
+    details=[]
+    for row in conn.execute("""SELECT o.*,a.name account_name FROM opening_balances o
+        JOIN accounts a ON a.client_id=o.client_id AND a.code=o.account_code
+        WHERE o.client_id=? AND (o.debit_fen<>0 OR o.credit_fen<>0) ORDER BY o.account_code""",(cid,)):
+        date=client['opening_period']+'-01'
+        details.append({'account_code':row['account_code'],'account_name':row['account_name'],
+            'date':date,'date_source':'opening_balance','summary':'建账期初余额','counterparty':'','invoice_number':'',
+            'amount_fen':abs(row['debit_fen']-row['credit_fen']),
+            'source':'opening_balance','source_type':'opening_balance','source_id':row['account_code'],
+            'source_label':'建账期初','reference':'建账期初','voucher_id':None,'line_id':None,'record_id':None,
+            **_balance_contribution(date,start,end,row['debit_fen'],row['credit_fen'],initial=True)})
+    for row in conn.execute("""SELECT l.id line_id,l.voucher_id,l.account_code,l.debit_fen,l.credit_fen,
+        l.summary line_summary,a.name account_name,v.date,v.number,v.period,v.summary voucher_summary,
+        v.source_type,v.source_id,v.reviewed,v.version voucher_version,v.counterparty voucher_counterparty,r.id record_id,r.transaction_json,r.invoice_number
+        FROM accounting_voucher_lines l JOIN vouchers v ON v.id=l.voucher_id
+        JOIN accounts a ON a.client_id=l.client_id AND a.code=l.account_code
+        LEFT JOIN reconciliation_records r ON v.source_type='reconciliation'
+            AND r.client_id=v.client_id AND CAST(r.id AS TEXT)=v.source_id
+        WHERE v.client_id=? AND v.status='active' AND v.period<=?
+        ORDER BY v.date,v.number,l.id""",(cid,end)):
+        transaction=_balance_object(row['transaction_json'])
+        details.append({'account_code':row['account_code'],'account_name':row['account_name'],
+            'date':row['date'],'date_source':'voucher','summary':row['line_summary'] or row['voucher_summary'],
+            'counterparty':_balance_text(transaction.get('counterparty')) or _balance_text(row['voucher_counterparty']),'invoice_number':row['invoice_number'] or '',
+            'amount_fen':max(abs(row['debit_fen']),abs(row['credit_fen'])),
+            'source':row['source_type'],'source_type':row['source_type'],'source_id':row['source_id'],
+            'source_label':'会计凭证','reference':f"记 {row['period']}-{row['number']:04d}",
+            'voucher_id':row['voucher_id'],'line_id':row['line_id'],'record_id':row['record_id'],'reviewed':bool(row['reviewed']),
+            'delete_token':_balance_delete_token('voucher',{'id':row['voucher_id'],'version':row['voucher_version']}),
+            **_balance_contribution(row['date'],start,end,row['debit_fen'],row['credit_fen'])})
+    details.extend(dict(row,voucher_id=None,line_id=None) for row in classified)
+    return sorted(details,key=lambda x:(x['account_code'],x['date'],x['voucher_id'] or 0,x['line_id'] or 0,x['record_id'] or 0))
+
+
+_BALANCE_AMOUNT_KEYS=('opening_debit_fen','opening_credit_fen','debit_fen','credit_fen',
+                      'closing_debit_fen','closing_credit_fen','ytd_debit_fen','ytd_credit_fen')
+
+
+def _balance_book_end(conn,cid,client,accounts):
+    """Use real report sources, rather than today's or the selected month."""
+    posted=conn.execute("SELECT MAX(period) FROM vouchers WHERE client_id=? AND status='active'",(cid,)).fetchone()[0]
+    classified=_balance_classifications(conn,cid,client['opening_period'],'9999-12',accounts)
+    return max([client['opening_period'],posted or client['opening_period']]+[row['date'][:7] for row in classified])
+
+
+def _balance_category_key(entry):
+    # A category describes the same counterparty and business purpose, not an
+    # individual receipt, amount or date. Whitespace must not split a company.
+    def normalized(value): return re.sub(r'\s+','',_balance_text(value)).casefold()
+    return (normalized(entry.get('counterparty')),normalized(entry.get('summary')) or normalized(entry.get('account_name')))
+
+
+def _balance_category_totals(entries):
+    result={key:sum(row.get(key,0) for row in entries) for key in _BALANCE_AMOUNT_KEYS}
+    # Debit and credit activity stay gross; balances are the net of the
+    # category, exactly like the actual parent account's balances.
+    for prefix in ('opening','closing'):
+        net=result[prefix+'_debit_fen']-result[prefix+'_credit_fen']
+        result[prefix+'_debit_fen']=max(net,0); result[prefix+'_credit_fen']=max(-net,0)
+    return result
+
+
+def _balance_categories(trial,details,all_details):
+    """Read-only numbered reporting categories, with real ledger references.
+
+    Build the registry from the entire book so changing a report period or
+    filter cannot renumber a category. Original account totals remain the
+    authoritative rollups; generated children never feed those totals twice.
+    """
+    accounts={row['account_code']:row for row in trial}
+    occupied=set(accounts)
+    registry={}; groups={}
+    for entry in all_details:
+        code=entry['account_code']
+        if code not in accounts: continue
+        key=_balance_category_key(entry)
+        groups.setdefault(code,{})
+        if key not in groups[code]: groups[code][key]=entry
+    category_rows=[]; redirected=False
+
+    def make_row(code,parent,name,original,level,is_leaf=True):
+        source=accounts[original]
+        return {'account_code':code,'code':code,'account_name':name,'name':name,
+                'parent_code':parent,'level':level,'is_leaf':is_leaf,'is_category':True,
+                'original_account_code':original,'source_account_codes':[original],
+                'category':source['category'],'direction':source['direction'],'report_key':source['report_key'],
+                'source_refs':[],**{key:0 for key in _BALANCE_AMOUNT_KEYS}}
+
+    def allocate(parent,level,original,items):
+        nonlocal redirected
+        # Each additional level has exactly two digits. Real account children
+        # and their prefixes are reserved, including customized account trees.
+        available=[parent+f'{i:02d}' for i in range(1,100)
+                   if not any(code==parent+f'{i:02d}' or code.startswith(parent+f'{i:02d}') for code in occupied)]
+        if not available and not any(code.startswith(parent+'00') for code in occupied):
+            # 00 is reserved for overflow only when every conventional child
+            # slot already belongs to a real account.
+            branch=parent+'00'
+            category_rows.append(make_row(branch,parent,'分类明细',original,level,False)); occupied.add(branch)
+            allocate(branch,level+1,original,items)
+            return
+        if not available:
+            # All 99 actual child slots are occupied. Place reporting details
+            # under a numbered reporting branch below the last actual child;
+            # that child is already represented in the account hierarchy.
+            branch=parent+'99'
+            branch_level=accounts.get(branch,{}).get('level',level)
+            if branch not in accounts:
+                category_rows.append(make_row(branch,parent,'分类明细',original,level,False))
+            redirected=True
+            allocate(branch,branch_level+1,original,items)
+            return
+        count=len(items)
+        direct=count if count<=len(available) else max(0,len(available)-1)
+        for code,(key,entry) in zip(available,items[:direct]):
+            counterparty=_balance_text(entry.get('counterparty')); purpose=_balance_text(entry.get('summary'))
+            name=(counterparty+'（'+purpose+'）' if counterparty and purpose and counterparty!=purpose
+                  else counterparty or purpose or entry.get('account_name') or '其他明细')
+            row=make_row(code,parent,name,original,level)
+            category_rows.append(row); occupied.add(code); registry[(original,key)]=row
+        if direct<count:
+            branch=available[-1]
+            category_rows.append(make_row(branch,parent,'更多明细',original,level,False)); occupied.add(branch)
+            allocate(branch,level+1,original,items[direct:])
+
+    for code,items in groups.items():
+        allocate(code,accounts[code]['level']+1,code,list(items.items()))
+    categorized=[]; entries_by_code={}
+    for entry in details:
+        category=registry.get((entry['account_code'],_balance_category_key(entry)))
+        if not category: continue
+        row=dict(entry,original_account_code=entry['account_code'],category_code=category['account_code'],
+                 category_name=category['account_name'],category_level=category['level'])
+        categorized.append(row); entries_by_code.setdefault(category['account_code'],[]).append(row)
+    for row in category_rows:
+        entries=[entry for code,values in entries_by_code.items() if code.startswith(row['account_code']) for entry in values]
+        row.update(_balance_category_totals(entries))
+        row['source_refs']=[{key:entry.get(key) for key in ('original_account_code','source_type','source_id','voucher_id','line_id','record_id')}
+                            for entry in entries]
+    originals=[]
+    for source in _trial_rollup(trial):
+        code=source['account_code']
+        if redirected:
+            # A completely occupied 00-99 range needs an existing display
+            # branch. Recompute that display hierarchy from allocated sources;
+            # the unchanged trial_balance still holds actual ledger totals.
+            source=dict(source,**_balance_category_totals([entry for entry in categorized if entry['category_code'].startswith(code)]))
+        originals.append(dict(source,code=code,name=source['account_name'],is_category=False,
+                              original_account_code=code,source_account_codes=[code],
+                              is_leaf=source['is_leaf'] and not any(row['parent_code']==code for row in category_rows)))
+    return sorted(originals+category_rows,key=lambda row:row['account_code']),categorized
+
+
+def balance_bundle(conn,cid,start,end):
+    client=_client(conn,cid); start=_period(start); end=_period(end)
+    if end<start: raise ApiError(400,'结束期间不能早于开始期间')
+    if start<client['opening_period']: raise ApiError(400,'查询期间不能早于建账月份')
+    formal_trial=_trial_range(conn,cid,start,end)
+    trial=[dict(row) for row in formal_trial]; accounts={row['account_code']:row for row in trial}
+    classified=_balance_classifications(conn,cid,start,end,accounts)
+    # This report incorporates documented expense classifications without
+    # inventing a funding account, a journal entry, or changing formal reports.
+    for entry in classified:
+        row=accounts[entry['account_code']]
+        begin=row['opening_debit_fen']-row['opening_credit_fen']+entry['opening_debit_fen']
+        finish=row['closing_debit_fen']-row['closing_credit_fen']+entry['amount_fen']
+        row.update(opening_debit_fen=max(begin,0),opening_credit_fen=max(-begin,0),
+                   closing_debit_fen=max(finish,0),closing_credit_fen=max(-finish,0))
+        row['debit_fen']+=entry['debit_fen']; row['ytd_debit_fen']+=entry['ytd_debit_fen']
+    details=_balance_details(conn,cid,client,start,end,classified)
+    book_end=_balance_book_end(conn,cid,client,accounts)
+    all_classified=_balance_classifications(conn,cid,client['opening_period'],book_end,accounts)
+    all_details=_balance_details(conn,cid,client,client['opening_period'],book_end,all_classified)
+    category_rows,details=_balance_categories(trial,details,all_details)
+    source_accounts=[dict(row) for row in conn.execute('SELECT * FROM accounts WHERE client_id=? ORDER BY code',(cid,))]
+    rollup=_trial_rollup(trial)
+    return {'start_period':start,'end_period':end,'report_basis':'vouchers_and_invoice_classifications',
+            'trial_balance':trial,'trial_balance_rollup':rollup,'expense_classifications':classified,
+            'posted_trial_balance_rollup':_trial_rollup(formal_trial) if classified else rollup,
+            'balance_details':details,'category_rows':category_rows,'balance_categories':category_rows,
+            'category_accounts':[{key:value for key,value in row.items() if key not in _BALANCE_AMOUNT_KEYS and key!='source_refs'} for row in category_rows],
+            'source_accounts':source_accounts,'book_start_period':client['opening_period'],'book_end_period':book_end,
+            'ledger':_ledger(conn,cid,start,end,formal_trial),'totals':{key:sum(r[key] for r in trial) for key in _BALANCE_AMOUNT_KEYS}}
+
+
+def standard_balance_bundle(conn,cid,start,end):
+    """Read-only, source-linked presentation after monthly profit/loss closing.
+
+    Actual journals and period/review status never change. Finance-income
+    credits on real business lines are shown as negative finance debits.
+    Canonical monthly closes reuse actual closing lines before projecting only
+    their missing amounts; December also transfers annual profit to retained
+    earnings. Replaying the full history makes range openings and YTD coherent.
+    """
+    result=balance_bundle(conn,cid,start,end)
+    client=_client(conn,cid); horizon=max(end,result['book_end_period'])
+    metadata={row['account_code']:dict(row) for row in result['trial_balance']}
+    actual=_balance_details(conn,cid,client,client['opening_period'],horizon,[])
+    profit='3103' if client['standard']=='small2013' else '4103'
+    retained='3104' if client['standard']=='small2013' else '4104'
+    balances={code:0 for code in metadata}; groups={}; templates={}
+    by_month={}; closing_pool={}; actual_closing=[]; normalized=[]; canonical=[]
+
+    def source_ref(entry):
+        return {key:entry.get(key) for key in ('source_type','source_id','voucher_id','line_id','record_id')}
+
+    def remember(entry,debit,credit):
+        code=entry['account_code']; key=_balance_category_key(entry)
+        balances[code]+=debit-credit
+        groups.setdefault(code,{})[key]=groups.get(code,{}).get(key,0)+debit-credit
+        templates.setdefault((code,key),entry)
+
+    displayed=[]
+    for original in actual:
+        entry=dict(original); code=entry['account_code']; initial=entry['source_type']=='opening_balance'
+        debit=entry['opening_debit_fen'] if initial else entry['debit_fen']
+        credit=entry['opening_credit_fen'] if initial else entry['credit_fen']
+        if entry['source_type']=='closing':
+            entry.update(original_debit_fen=debit,original_credit_fen=credit,remaining_fen=abs(debit-credit))
+            closing_pool.setdefault((entry['date'][:7],code,'debit' if debit-credit>0 else 'credit'),[]).append(entry)
+            actual_closing.append(entry)
+            continue
+        entry.update(original_debit_fen=debit,original_credit_fen=credit,
+                     report_debit_fen=debit,report_credit_fen=credit,is_projection=False,read_only=True)
+        if (not initial and metadata[code]['category']=='expense' and
+                metadata[code]['report_key']=='finance' and credit):
+            entry.update(report_debit_fen=debit-credit,report_credit_fen=0,
+                         report_adjustment='finance_income_credit_as_negative_debit')
+            normalized.append(dict(source_ref(entry),account_code=code,amount_fen=credit))
+        displayed.append(entry)
+        if initial: remember(entry,debit,credit)
+        else: by_month.setdefault(entry['date'][:7],[]).append(entry)
+
+    def closing_line(period,phase,code,debit,credit,related_codes):
+        if code not in metadata: raise ApiError(409,'标准结转口径缺少科目 '+code)
+        amount=debit or credit; side='debit' if debit else 'credit'; effect=1 if debit else -1
+        candidates=[(key,net) for key,net in groups.get(code,{}).items() if net*effect<0]
+        allocations=[]; remaining=amount
+        for key,net in candidates:
+            take=min(remaining,abs(net)); allocations.append((templates[(code,key)],key,take))
+            remaining-=take
+            if not remaining: break
+        if remaining:
+            template={'counterparty':'','summary':'年度利润结转' if phase=='annual' else '损益结转'}
+            allocations.append((template,_balance_category_key(template),remaining))
+        related=[source_ref(item) for item in actual if item['account_code'] in related_codes and item['date'][:7]<=period]
+        related.extend(ref for item in canonical if item['account_code'] in related_codes and item['date'][:7]<=period
+                       for ref in item.get('related_source_refs',[]))
+        related=list({json.dumps(ref,sort_keys=True):ref for ref in related}.values())
+        for template,key,allocation in allocations:
+            remaining=allocation
+            while remaining:
+                pool=closing_pool.get((period,code,side),[])
+                real=next((item for item in pool if item['remaining_fen']),None)
+                take=min(remaining,real['remaining_fen']) if real else remaining
+                category_id=hashlib.sha256(json.dumps(key,ensure_ascii=False).encode()).hexdigest()[:16]
+                entry={'account_code':code,'account_name':metadata[code]['account_name'],
+                       'date':_last_date(period),'date_source':'report_closing','period':period,
+                       'summary':template['summary'],'counterparty':template.get('counterparty',''),'invoice_number':'',
+                       'amount_fen':take,'report_debit_fen':take if debit else 0,'report_credit_fen':take if credit else 0,
+                       'source':'report_closing','source_type':'report_closing',
+                       'source_id':f'standard:{cid}:{period}:{phase}:{code}:{category_id}',
+                       'source_label':'报表损益结转测算','reference':'报表测算 '+period,
+                       'voucher_id':None,'line_id':None,'record_id':None,'is_projection':True,'read_only':True,
+                       'projection_phase':phase,'related_source_refs':related}
+                if real:
+                    entry.update({field:real.get(field) for field in ('source','source_type','source_id','voucher_id','line_id','record_id','reference','reviewed')})
+                    entry.update(source_label='实际损益结转凭证',date_source='voucher',is_projection=False,
+                                 original_debit_fen=real['original_debit_fen'],original_credit_fen=real['original_credit_fen'])
+                    real['remaining_fen']-=take
+                displayed.append(entry); canonical.append(entry)
+                remember(entry,entry['report_debit_fen'],entry['report_credit_fen'])
+                remaining-=take
+
+    period=client['opening_period']
+    while period<=horizon:
+        for entry in by_month.get(period,[]): remember(entry,entry['original_debit_fen'],entry['original_credit_fen'])
+        pending=[]
+        for code,row in metadata.items():
+            if row['category'] not in ('income','expense') or not balances[code]: continue
+            value=balances[code]
+            pending.append((code,max(-value,0),max(value,0)))
+        diff=sum(debit-credit for _,debit,credit in pending)
+        profit_codes=[code for code,_,_ in pending]
+        for code,debit,credit in pending: closing_line(period,'monthly',code,debit,credit,[code])
+        if diff: closing_line(period,'monthly',profit,max(-diff,0),max(diff,0),profit_codes)
+        if period.endswith('-12') and balances.get(profit,0):
+            value=balances[profit]
+            closing_line(period,'annual',profit,max(-value,0),max(value,0),[profit]+profit_codes)
+            closing_line(period,'annual',retained,max(value,0),max(-value,0),[profit]+profit_codes)
+        if period==horizon: break
+        period=_month_add(period,1)
+
+    def contribution(entry,range_start,range_end):
+        initial=entry['source_type']=='opening_balance'
+        return dict(entry,**_balance_contribution(entry['date'],range_start,range_end,
+                    entry['report_debit_fen'],entry['report_credit_fen'],initial=initial))
+
+    all_details=[contribution(entry,client['opening_period'],horizon) for entry in displayed]
+    details=[contribution(entry,start,end) for entry in displayed if entry['date'][:7]<=end]
+    trial=[]
+    for code,row in metadata.items():
+        amounts=_balance_category_totals([entry for entry in details if entry['account_code']==code])
+        trial.append(dict(row,**amounts))
+    category_rows,details=_balance_categories(trial,details,all_details)
+    projected=[entry for entry in canonical if entry['is_projection'] and entry['date'][:7]<=end]
+    normalized=[entry for entry in normalized if any(item['line_id']==entry['line_id'] and item['date'][:7]<=end for item in actual)]
+    closing_adjustments=[dict(source_ref(entry),account_code=entry['account_code'],unrepresented_amount_fen=entry['remaining_fen'])
+                         for entry in actual_closing if entry['remaining_fen'] and entry['date'][:7]<=end]
+    if closing_adjustments:
+        raise ApiError(409,'实际损益结转分录与标准逐月口径不一致，请先核对原凭证；可切换实际发生额查看。',closing_adjustments)
+    source_accounts=result['source_accounts']
+    result.update(basis='standard',report_basis='standard_after_profit_loss_closing',report_title='余额表（损益结转口径）',
+                  has_projection=bool(projected),projection_note='仅报表测算损益结转；未生成会计凭证、未审核凭证、未改变结账状态。' if projected else '当前范围无待测算损益；未新增会计凭证或改变结账状态。',
+                  trial_balance=trial,trial_balance_rollup=_trial_rollup(trial),balance_details=details,
+                  category_rows=category_rows,balance_categories=category_rows,
+                  category_accounts=[{key:value for key,value in row.items() if key not in _BALANCE_AMOUNT_KEYS and key!='source_refs'} for row in category_rows],
+                  projection_entries=[contribution(entry,start,end) for entry in projected],
+                  normalized_source_refs=normalized,closing_presentation_adjustments=closing_adjustments,
+                  unposted_expense_classifications=result['expense_classifications'],expense_classifications=[],
+                  source_accounts=source_accounts,totals={key:sum(row[key] for row in trial) for key in _BALANCE_AMOUNT_KEYS})
+    return result
+
+
+def _dashboard(conn,cid,period,trial):
+    voucher_periods=[dict(row) for row in conn.execute("SELECT period,COUNT(*) voucher_count,COALESCE(SUM(attachment_count),0) attachment_count FROM vouchers WHERE client_id=? AND status='active' GROUP BY period ORDER BY period DESC",(cid,))]
+    vouchers=next((row for row in voucher_periods if row['period']==period),{'voucher_count':0,'attachment_count':0})
+    voucher_history={'voucher_count':sum(row['voucher_count'] for row in voucher_periods),
+                     'attachment_count':sum(row['attachment_count'] for row in voucher_periods),
+                     'periods':voucher_periods}
+    invoices={kind:{'count':0,'total_fen':0,'tax_fen':0} for kind in ('input','output','expense')}
+    for row in conn.execute('SELECT kind,COUNT(*) count,SUM(total_fen) total_fen,SUM(tax_fen) tax_fen FROM invoices WHERE client_id=? AND period=? GROUP BY kind',(cid,period)):
+        if row['kind'] in invoices: invoices[row['kind']]={key:row[key] for key in ('count','total_fen','tax_fen')}
+    def net(prefix,credit=False):
+        result=sum(r['closing_debit_fen']-r['closing_credit_fen'] for r in trial if r['account_code'].startswith(prefix))
+        return -result if credit else result
+    funds={'bank_fen':net('1002'),'cash_fen':net('1001'),'receivable_fen':net('1122'),'payable_fen':net('2202',True)}
+    for prefix,key in (('1122','receivable_account_count'),('2202','payable_account_count')):
+        funds[key]=sum(1 for r in trial if r['account_code'].startswith(prefix) and len(r['account_code'])>len(prefix) and r['is_leaf'] and (r['closing_debit_fen'] or r['closing_credit_fen']))
+    return {'voucher_count':vouchers['voucher_count'],'attachment_count':vouchers['attachment_count'],'voucher_history':voucher_history,'invoices':invoices,
+            'funds':funds,'tax_payable_fen':net('2221',True)}
+
+
+def _reports(conn,cid,period,trial):
+    bs={}; income=expense=unclosed=0
+    for row in trial:
+        net=row['closing_debit_fen']-row['closing_credit_fen']; category=row['category']; key=row['report_key']
+        if category in ('income','expense'):
+            unclosed-=net
+        else:
+            val=net if category in ('asset','cost') else -net
+            bs[key]=bs.get(key,0)+val
+    assets=sum(r['closing_debit_fen']-r['closing_credit_fen'] for r in trial if r['category'] in ('asset','cost'))
+    liabilities=sum(r['closing_credit_fen']-r['closing_debit_fen'] for r in trial if r['category']=='liability')
+    equity=sum(r['closing_credit_fen']-r['closing_debit_fen'] for r in trial if r['category']=='equity')+unclosed
+    pl={}; ytd={}
+    for row in conn.execute("SELECT a.category,a.report_key,SUM(l.debit_fen-l.credit_fen) net FROM accounting_voucher_lines l JOIN vouchers v ON v.id=l.voucher_id JOIN accounts a ON a.client_id=l.client_id AND a.code=l.account_code WHERE v.client_id=? AND v.status='active' AND v.source_type<>'closing' AND v.period=? AND a.category IN ('income','expense') GROUP BY a.category,a.report_key",(cid,period)):
+        val=-row['net'] if row['category']=='income' else row['net']; pl[row['report_key']]=pl.get(row['report_key'],0)+val
+        if row['category']=='income': income+=val
+        else: expense+=val
+    yi=ye=0
+    for row in conn.execute("SELECT a.category,a.report_key,SUM(l.debit_fen-l.credit_fen) net FROM accounting_voucher_lines l JOIN vouchers v ON v.id=l.voucher_id JOIN accounts a ON a.client_id=l.client_id AND a.code=l.account_code WHERE v.client_id=? AND v.status='active' AND v.source_type<>'closing' AND v.period BETWEEN ? AND ? AND a.category IN ('income','expense') GROUP BY a.category,a.report_key",(cid,period[:4]+'-01',period)):
+        val=-row['net'] if row['category']=='income' else row['net']; ytd[row['report_key']]=ytd.get(row['report_key'],0)+val
+        if row['category']=='income': yi+=val
+        else: ye+=val
+    cash={c:{'key':c,'name':{'operating':'经营活动','investing':'投资活动','financing':'筹资活动','transfer':'内部转账','unclassified':'未分类'}[c],
+             'inflow_fen':0,'outflow_fen':0,'net_fen':0} for c in CASH_CATEGORIES}
+    unclassified=0
+    for row in conn.execute("SELECT l.debit_fen,l.credit_fen,l.cashflow_category FROM accounting_voucher_lines l JOIN vouchers v ON v.id=l.voucher_id JOIN accounts a ON a.client_id=l.client_id AND a.code=l.account_code WHERE v.client_id=? AND v.status='active' AND v.period=? AND a.report_key='cash'",(cid,period)):
+        cat=row['cashflow_category']; x=cash[cat]; x['inflow_fen']+=row['debit_fen']; x['outflow_fen']+=row['credit_fen']; x['net_fen']+=row['debit_fen']-row['credit_fen']
+        if cat=='unclassified': unclassified+=1
+    bsrows=[{'key':k,'name':REPORT_KEYS.get(k,k),'amount_fen':v} for k,v in bs.items()]
+    if unclosed: bsrows.append({'key':'unclosed_profit','name':'未结转损益','amount_fen':unclosed})
+    plkeys=list(dict.fromkeys(list(pl)+list(ytd)))
+    plrows=[{'key':k,'name':REPORT_KEYS.get(k,k),'amount_fen':pl.get(k,0),'ytd_fen':ytd.get(k,0)} for k in plkeys]
+    client=_client(conn,cid)
+    return {'balance_sheet':{'rows':bsrows,'assets_fen':assets,'liabilities_fen':liabilities,'equity_fen':equity,'unclosed_profit_fen':unclosed,'balanced':assets==liabilities+equity,
+                'basis':'科目余额管理报表；往来重分类、减值/递延税等调整须由会计录入并复核，不替代法定列报。'},
+            'profit_loss':{'rows':plrows,'income_fen':income,'expense_fen':expense,'profit_fen':income-expense,'ytd_profit_fen':yi-ye},
+            'cash_flow':{'rows':list(cash.values()),'net_fen':sum(x['net_fen'] for x in cash.values()),'unclassified_count':unclassified,'complete':unclassified==0,
+                'basis':'人工逐笔分类的货币资金收支汇总，内部转账净额必须为零；未分类时不能作为完整现金流量表。'},
+            'statutory':build_statutory(conn,client,period,trial)}
+
+
+def _asset_rows(conn,cid,period):
+    rows=[dict(x) for x in conn.execute('''SELECT a.*,COALESCE(d.total,0) accumulated_fen,a.cost_fen-COALESCE(d.total,0) net_fen FROM assets a
+        LEFT JOIN (SELECT ad.asset_id,SUM(ad.amount_fen) total FROM asset_depreciations ad JOIN vouchers v ON v.id=ad.voucher_id WHERE ad.period<=? AND v.status='active' GROUP BY ad.asset_id) d ON d.asset_id=a.id WHERE a.client_id=? AND substr(a.purchase_date,1,7)<=? ORDER BY a.id''',(period,cid,period))]
+    for row in rows:
+        row['depreciations']=[dict(x) for x in conn.execute('SELECT id,period,amount_fen,voucher_id FROM asset_depreciations WHERE asset_id=? AND period<=? ORDER BY period',(row['id'],period))]
+        if row['status']=='cancelled':
+            row['net_fen']=0
+            continue
+        disposed=bool(row['disposal_date'] and row['disposal_date'][:7]<=period)
+        row['status']='disposed' if disposed else 'active'
+        if disposed: row['net_fen']=0
+    return rows
+
+
+def _period_check_details(conn,cid,period,trial,check,asset_cards):
+    """Read-only evidence for the selected book/period; keep close audits compact."""
+    def details(reason,action,columns,rows,total=None):
+        rows=[dict(row) for row in rows]
+        total=len(rows) if total is None else total
+        return {'reason':reason,'action':action,
+                'columns':[dict(key=c[0],label=c[1],**({'format':c[2]} if len(c)>2 else {})) for c in columns],
+                'rows':rows[:100],'total':total,'truncated':total>min(len(rows),100)}
+
+    def records(sql,params):
+        total=conn.execute('SELECT COUNT(*) FROM ('+sql+')',params).fetchone()[0]
+        return [dict(row) for row in conn.execute(sql+' LIMIT 100',params)],total
+
+    code=check['code']
+    if code=='review':
+        rows,total=records('''SELECT v.id voucher_id,v.number,v.date,v.summary,
+            COALESCE(SUM(l.debit_fen),0) amount_fen,
+            GROUP_CONCAT(DISTINCT l.account_code||' '||a.name) accounts
+            FROM vouchers v LEFT JOIN accounting_voucher_lines l ON l.voucher_id=v.id AND l.client_id=v.client_id
+            LEFT JOIN accounts a ON a.client_id=l.client_id AND a.code=l.account_code
+            WHERE v.client_id=? AND v.period=? AND v.status='active' AND v.reviewed=0
+            GROUP BY v.id ORDER BY v.number,v.id''',(cid,period))
+        for row in rows: row['voucher_number']=f'记-{row["number"]:03d}'
+        return details(f'{period}期间仍有有效凭证未审核，结账前须完成审核。',
+                       '在“凭证”中按凭证字号核对摘要、科目和金额，确认无误后审核；有误时先更正凭证。',
+                       [('voucher_number','凭证字号'),('date','日期'),('summary','摘要'),('accounts','会计科目'),('amount_fen','凭证金额','money')],rows,total)
+    if code=='cashflow':
+        rows,total=records('''SELECT v.id voucher_id,l.id line_id,v.number,v.date,
+            COALESCE(NULLIF(l.summary,''),v.summary) summary,l.account_code,a.name account_name,l.debit_fen,l.credit_fen
+            FROM accounting_voucher_lines l JOIN vouchers v ON v.id=l.voucher_id
+            JOIN accounts a ON a.client_id=l.client_id AND a.code=l.account_code
+            WHERE v.client_id=? AND l.client_id=? AND v.period=? AND v.status='active'
+              AND a.report_key='cash' AND l.cashflow_category='unclassified' ORDER BY v.number,l.id''',(cid,cid,period))
+        for row in rows: row['voucher_number']=f'记-{row["number"]:03d}'
+        return details(f'{period}期间以下货币资金分录尚未指定现金流活动类别，现金流报告因此不完整。',
+                       '在“凭证”的“资金分类”中，逐笔选择经营、投资、筹资或内部转账活动，再重新检查。',
+                       [('voucher_number','凭证字号'),('date','日期'),('summary','摘要'),('account_code','科目编码'),('account_name','科目名称'),('debit_fen','借方金额','money'),('credit_fen','贷方金额','money')],rows,total)
+    if code=='journal':
+        rows,total=records('''SELECT id journal_id,date,summary,bank_account,counter_account,
+            CASE WHEN direction='income' THEN '收入' ELSE '支出' END direction,amount_fen
+            FROM journals WHERE client_id=? AND period=? AND voucher_id IS NULL ORDER BY date,id''',(cid,period))
+        return details(f'{period}期间以下银行日记账尚未关联记账凭证。',
+                       '在“日记账”中核对收支方向、银行科目、对方科目和金额，确认后生成凭证。',
+                       [('date','日期'),('summary','摘要'),('bank_account','银行科目'),('counter_account','对方科目'),('direction','收支方向'),('amount_fen','金额','money')],rows,total)
+    if code=='payroll':
+        rows,total=records('''SELECT id payroll_id,period,employee_name,gross_fen,net_fen,expense_account
+            FROM payroll WHERE client_id=? AND period=? AND voucher_id IS NULL ORDER BY employee_name,id''',(cid,period))
+        return details(f'{period}期间以下工资记录尚未生成计提凭证。',
+                       '在“工资”中核对员工、应发工资、扣款和费用科目，完成本期工资计提后重新检查。',
+                       [('period','期间'),('employee_name','员工'),('gross_fen','应发工资','money'),('net_fen','实发工资','money'),('expense_account','费用科目')],rows,total)
+    if code=='depreciation':
+        rows=[{'asset_id':a['id'],'name':a['name'],'purchase_date':a['purchase_date'],'start_period':a['start_period'],
+               'cost_fen':a['cost_fen'],'accumulated_fen':a['accumulated_fen'],'net_fen':a['net_fen'],'expense_account':a['expense_account']}
+              for a in asset_cards if a['status']=='active' and a['start_period']<=period
+              and (not a['disposal_date'] or a['disposal_date'][:7]>=period) and a['net_fen']>a['residual_fen']
+              and not any(d['period']==period for d in a['depreciations'])]
+        return details(f'以下资产已到起提月份，且截至{period}仍有可折旧余额，本期尚无折旧计提记录。',
+                       '在“固定资产”中核对资产卡片并计提本月折旧；存在漏提月份时须从以前月份按月补提。',
+                       [('name','资产名称'),('purchase_date','购置日期'),('start_period','起提月份'),('cost_fen','原值','money'),('accumulated_fen','累计折旧','money'),('net_fen','净值','money'),('expense_account','费用科目')],rows)
+    if code=='trial':
+        debit=sum(r['closing_debit_fen'] for r in trial); credit=sum(r['closing_credit_fen'] for r in trial)
+        rows=[r for r in trial if r['closing_debit_fen'] or r['closing_credit_fen']]
+        return details(f'截至{period}的期末借方余额合计{Decimal(debit)/100:.2f}元、贷方余额合计{Decimal(credit)/100:.2f}元，差额{Decimal(debit-credit)/100:.2f}元。以下列出非零余额科目供核对。',
+                       '在“科目余额表”核对期初余额和本期凭证，查明并更正借贷差额后重新检查。',
+                       [('account_code','科目编码'),('account_name','科目名称'),('closing_debit_fen','期末借方','money'),('closing_credit_fen','期末贷方','money')],rows)
+    if code in ('inventory','asset_balance'):
+        account=check['account_code']; account_name=next((r['account_name'] for r in trial if r['account_code']==account),'')
+        gl=sum(r['closing_debit_fen']-r['closing_credit_fen'] for r in trial if r['account_code']==account)
+        if code=='inventory':
+            expected=conn.execute("SELECT COALESCE(SUM(CASE WHEN direction='in' THEN amount_fen ELSE -amount_fen END),0) FROM inventory_movements m JOIN inventory_items i ON i.id=m.item_id WHERE i.client_id=? AND i.inventory_account=? AND m.status='active' AND substr(m.date,1,7)<=?",(cid,account,period)).fetchone()[0]
+            basis='存货数量台账'; action='在“存货”核对出入库记录及其凭证，并与“科目余额表”核对；查明差额并更正后重新检查。'
+        else:
+            expected=sum((a['cost_fen'] if a['asset_account']==account else 0)-(a['accumulated_fen'] if a['depreciation_account']==account else 0) for a in asset_cards if a['status']=='active')
+            basis='资产卡片'; action='在“固定资产”核对购置、折旧和处置记录及其凭证，并与“科目余额表”核对；更正后重新检查。'
+        return details(f'截至{period}，科目{account}的总账余额与{basis}余额不一致。以下金额均按借方减贷方列示，负数表示贷方余额。',action,
+                       [('account_code','科目编码'),('account_name','科目名称'),('ledger_fen','总账余额','money'),('subledger_fen',basis+'余额','money'),('difference_fen','差额','money')],
+                       [{'account_code':account,'account_name':account_name,'ledger_fen':gl,'subledger_fen':expected,'difference_fen':gl-expected}])
+    return details(f'{period}期间本地账务检查通过，未发现当前检查范围内的待处理项目。',
+                   '可按业务安排进行本期结账；此结果不代表税局或外部机构审核。',[],[])
+
+
+def _checks(conn,cid,period,trial=None,reports=None,include_details=False):
+    trial=trial if trial is not None else _trial(conn,cid,period)
+    reports=reports if reports is not None else _reports(conn,cid,period,trial)
+    checks=[]
+    if sum(x['closing_debit_fen']-x['closing_credit_fen'] for x in trial):
+        checks.append({'code':'trial','severity':'error','message':'科目余额试算不平，不能结账'})
+    unreviewed=conn.execute("SELECT COUNT(*) FROM vouchers WHERE client_id=? AND period=? AND status='active' AND reviewed=0",(cid,period)).fetchone()[0]
+    if unreviewed: checks.append({'code':'review','severity':'error','message':f'{unreviewed}张凭证未审核，须先审核后结账'})
+    pending=conn.execute('SELECT COUNT(*) FROM journals WHERE client_id=? AND period=? AND voucher_id IS NULL',(cid,period)).fetchone()[0]
+    if pending: checks.append({'code':'journal','severity':'warning','message':f'{pending}条银行日记账尚未生成凭证'})
+    missing=conn.execute('SELECT COUNT(*) FROM payroll WHERE client_id=? AND period=? AND voucher_id IS NULL',(cid,period)).fetchone()[0]
+    if missing: checks.append({'code':'payroll','severity':'error','message':f'{missing}条工资尚未计提'})
+    cf=reports['cash_flow']['unclassified_count']
+    if cf: checks.append({'code':'cashflow','severity':'warning','message':f'{cf}条货币资金分录未分类，现金流报告不完整'})
+    due=[]
+    for a in _asset_rows(conn,cid,period):
+        if a['status']=='active' and a['start_period']<=period and (not a['disposal_date'] or a['disposal_date'][:7]>=period) and a['net_fen']>a['residual_fen']:
+            if not conn.execute('SELECT 1 FROM asset_depreciations WHERE asset_id=? AND period=?',(a['id'],period)).fetchone(): due.append(a['name'])
+    if due: checks.append({'code':'depreciation','severity':'error','message':f'{len(due)}项资产本月尚未计提折旧'})
+    # Reconcile supported inventory subledger with its aggregate GL controls.
+    controls={r['inventory_account'] for r in conn.execute('SELECT inventory_account FROM inventory_items WHERE client_id=?',(cid,))}
+    for code in controls:
+        value=conn.execute("SELECT COALESCE(SUM(CASE WHEN direction='in' THEN amount_fen ELSE -amount_fen END),0) FROM inventory_movements m JOIN inventory_items i ON i.id=m.item_id WHERE i.client_id=? AND i.inventory_account=? AND m.status='active' AND substr(m.date,1,7)<=?",(cid,code,period)).fetchone()[0]
+        gl=sum(x['closing_debit_fen']-x['closing_credit_fen'] for x in trial if x['account_code']==code)
+        if gl!=value: checks.append({'code':'inventory','severity':'error','account_code':code,'message':f'存货科目{code}总账与数量台账相差{gl-value}分，须核对后结账'})
+    asset_cards=_asset_rows(conn,cid,period)
+    asset_controls={a[k] for a in asset_cards for k in ('asset_account','depreciation_account')}
+    for code in asset_controls:
+        expected=sum((a['cost_fen'] if a['asset_account']==code else 0)-(a['accumulated_fen'] if a['depreciation_account']==code else 0) for a in asset_cards if a['status']=='active')
+        gl=sum(r['closing_debit_fen']-r['closing_credit_fen'] for r in trial if r['account_code']==code)
+        if gl!=expected: checks.append({'code':'asset_balance','severity':'error','account_code':code,'message':f'资产科目{code}总账与资产卡片相差{gl-expected}分，须核对后结账'})
+    if not checks: checks.append({'code':'ok','severity':'info','message':'本地账务检查通过；不代表税局或外部机构审核'})
+    if include_details:
+        for check in checks: check['details']=_period_check_details(conn,cid,period,trial,check,asset_cards)
+    return checks
+
+
+def bundle(conn,cid,period):
+    client=_client(conn,cid); _period(period)
+    if period < client['opening_period']:
+        raise ApiError(400,'所选期间早于建账期间')
+    accounts=[dict(x) for x in conn.execute('SELECT * FROM accounts WHERE client_id=? ORDER BY code',(cid,))]
+    preset_codes={row[0] for row in _template(client['standard'])}
+    for account in accounts: account['is_preset']=account['code'] in preset_codes
+    trial=_trial(conn,cid,period); reports=_reports(conn,cid,period,trial)
+    vouchers=[_voucher(conn,cid,x['id']) for x in conn.execute('SELECT id FROM vouchers WHERE client_id=? AND period=? ORDER BY number',(cid,period))]
+    ledger=_ledger(conn,cid,period,period,trial)
+    periods=[]
+    for m in range(1,13):
+        p=period[:4]+f'-{m:02d}'
+        existing=conn.execute('SELECT * FROM book_periods WHERE client_id=? AND period=?',(cid,p)).fetchone()
+        item=dict(existing) if existing else {'client_id':cid,'period':p,'closed':0,'version':0,'closing_voucher_id':None}
+        counts=conn.execute("SELECT COUNT(*) n,COALESCE(SUM(CASE WHEN reviewed=0 THEN 1 ELSE 0 END),0) u FROM vouchers WHERE client_id=? AND period=? AND status='active'",(cid,p)).fetchone()
+        item.update(status='closed' if item['closed'] else 'open',voucher_count=counts['n'],unreviewed_count=counts['u']); periods.append(item)
+    inventory=[]
+    for item in conn.execute('SELECT * FROM inventory_items WHERE client_id=? ORDER BY sku',(cid,)):
+        x=dict(item); q=Decimal(0); val=0
+        for m in conn.execute("SELECT * FROM inventory_movements WHERE item_id=? AND status='active' AND substr(date,1,7)<=? ORDER BY date,id",(x['id'],period)):
+            sign=1 if m['direction']=='in' else -1; q+=Decimal(m['quantity'])*sign; val+=m['amount_fen']*sign
+        x['quantity']=format(q,'f'); x['value_fen']=val; inventory.append(x)
+    settings=conn.execute('SELECT opening_version FROM book_settings WHERE client_id=?',(cid,)).fetchone()
+    return {'client':client,'period':period,'accounts':accounts,'opening_balances':[dict(x) for x in conn.execute('SELECT * FROM opening_balances WHERE client_id=? ORDER BY account_code',(cid,))],
+            'opening_version':settings[0] if settings else 1,'vouchers':vouchers,'trial_balance':trial,'trial_balance_rollup':_trial_rollup(trial),'ledger':ledger,'reports':reports,'dashboard':_dashboard(conn,cid,period,trial),
+            'assets':_asset_rows(conn,cid,period),'inventory_items':inventory,'inventory_movements':[dict(x) for x in conn.execute('SELECT m.*,i.name item_name FROM inventory_movements m JOIN inventory_items i ON i.id=m.item_id WHERE m.client_id=? AND substr(m.date,1,7)=? ORDER BY m.date,m.id',(cid,period))],
+            'payroll':[dict(x) for x in conn.execute('SELECT * FROM payroll WHERE client_id=? AND period=? ORDER BY employee_name',(cid,period))],
+            'periods':periods,'checks':_checks(conn,cid,period,trial,reports,include_details=True),'journals':[dict(x) for x in conn.execute('SELECT * FROM journals WHERE client_id=? AND period=? ORDER BY date,id',(cid,period))]}
+
+
+def import_opening_snapshot(conn,cid,period,balances,source,user=None):
+    """Attach a verified opening snapshot to an otherwise unposted book.
+
+    Called by audited migrations, never inferred from a report's date. Original
+    book setup dates and void voucher history are retained. Caller owns commit.
+    """
+    client=_client(conn,cid); period=_period(period)
+    if period<client['start_period'] or not isinstance(source,dict) or not source.get('sha256'):
+        raise ApiError(400,'期初生效月份或来源凭据无效')
+    if (conn.execute('SELECT 1 FROM opening_balances WHERE client_id=?',(cid,)).fetchone()
+        or conn.execute("SELECT 1 FROM vouchers WHERE client_id=? AND status='active'",(cid,)).fetchone()
+        or conn.execute('SELECT 1 FROM book_periods WHERE client_id=? AND closed=1',(cid,)).fetchone()):
+        raise ApiError(409,'账套已有期初、有效凭证或结账，不能重设期初衔接')
+    if not isinstance(balances,list) or not balances:
+        raise ApiError(400,'期初快照缺少明细余额')
+    values=[]; seen=set()
+    for row in balances:
+        account=_account(conn,cid,row.get('account_code'))
+        code=account['code']; debit=amount(row.get('debit_fen',0)); credit=amount(row.get('credit_fen',0))
+        if code in seen or bool(debit)==bool(credit) or conn.execute('SELECT 1 FROM accounts WHERE client_id=? AND code LIKE ? AND code<>?',(cid,code+'%',code)).fetchone():
+            raise ApiError(400,'期初快照须为不重复的末级科目单向余额')
+        seen.add(code); values.append((cid,code,debit,credit))
+    if sum(row[2]-row[3] for row in values): raise ApiError(400,'期初快照借贷不平衡')
+    conn.executemany('INSERT INTO opening_balances(client_id,account_code,debit_fen,credit_fen) VALUES(?,?,?,?)',values)
+    conn.execute('INSERT OR IGNORE INTO book_settings(client_id) VALUES(?)',(cid,))
+    conn.execute('UPDATE book_settings SET opening_period=?,opening_version=opening_version+1 WHERE client_id=?',(period,cid))
+    audit(conn,user,'import_opening_snapshot','book',cid,{'start_period':client['start_period'],'opening_period':period,'balances':balances,'source':source})
+    return {'opening_period':period,'rows':len(values)}
+
+
+def _opening(conn,cid,payload,user):
+    c=_client(conn,cid)
+    if conn.execute('SELECT 1 FROM vouchers WHERE client_id=? LIMIT 1',(cid,)).fetchone() or conn.execute('SELECT 1 FROM book_periods WHERE client_id=? AND closed=1',(cid,)).fetchone():
+        raise ApiError(409,'已发生凭证或结账，期初锁定；请用调整凭证更正')
+    rows=payload.get('balances'); version=conn.execute('SELECT opening_version FROM book_settings WHERE client_id=?',(cid,)).fetchone()[0]
+    if type(payload.get('version')) is not int or payload['version']!=version:
+        raise ApiError(409,'期初版本已变化，请刷新',{'current_version':version})
+    if not isinstance(rows,list) or len(rows)>5000: raise ApiError(400,'期初余额格式错误')
+    vals=[]; codes=set()
+    for x in rows:
+        a=_account(conn,cid,x.get('account_code'))
+        if a['code'] in codes: raise ApiError(400,'期初科目不能重复')
+        codes.add(a['code']); d=amount(x.get('debit_fen',0)); cr=amount(x.get('credit_fen',0))
+        if d and cr: raise ApiError(400,'科目期初不能同时有借方与贷方余额')
+        if a['category'] in ('income','expense') and (d or cr):
+            raise ApiError(400,'本系统无历史迁移：损益科目期初须为零，请先完成上期结转')
+        if conn.execute('SELECT 1 FROM accounts WHERE client_id=? AND code LIKE ? AND code<>?',(cid,a['code']+'%',a['code'])).fetchone() and (d or cr):
+            raise ApiError(400,'期初余额须填写末级科目')
+        vals.append((cid,a['code'],d,cr))
+    if sum(x[2] for x in vals)!=sum(x[3] for x in vals): raise ApiError(400,'期初试算不平，未保存')
+    conn.execute('DELETE FROM opening_balances WHERE client_id=?',(cid,)); conn.executemany('INSERT INTO opening_balances(client_id,account_code,debit_fen,credit_fen) VALUES(?,?,?,?)',vals)
+    conn.execute('UPDATE book_settings SET opening_version=opening_version+1 WHERE client_id=?',(cid,))
+    audit(conn,user,'opening','book',cid,{'balances':rows,'previous_version':version})
+    return {'balanced':True,'version':version+1}
+
+
+def _close(conn,cid,payload,user):
+    p=_period(payload.get('period')); c=_open(conn,cid,p)
+    if payload.get('version') is not None:
+        current=conn.execute('SELECT version FROM book_periods WHERE client_id=? AND period=?',(cid,p)).fetchone()
+        _version({'version':current[0] if current else 0},payload)
+    if p>c['opening_period']:
+        prev=conn.execute('SELECT closed FROM book_periods WHERE client_id=? AND period=?',(cid,_month_add(p,-1))).fetchone()
+        if not prev or not prev[0]: raise ApiError(409,'请按建账月份起顺序结账')
+    checks=_checks(conn,cid,p)
+    errors=[x for x in checks if x['severity']=='error']
+    if errors: raise ApiError(409,'结账检查未通过',errors)
+    trial=_trial(conn,cid,p); lines=[]
+    for row in trial:
+        if row['category'] in ('income','expense'):
+            balance=row['closing_debit_fen']-row['closing_credit_fen']
+            if balance>0: lines.append(_entry(row['account_code'],credit=balance))
+            elif balance<0: lines.append(_entry(row['account_code'],-balance))
+    vid=None
+    diff=sum(x['debit_fen']-x['credit_fen'] for x in lines)
+    profit='3103' if c['standard']=='small2013' else '4103'
+    if lines:
+        if diff>0: lines.append(_entry(profit,credit=diff))
+        elif diff<0: lines.append(_entry(profit,-diff))
+    if p.endswith('-12'):
+        previous_profit=sum(r['closing_credit_fen']-r['closing_debit_fen'] for r in trial if r['account_code']==profit)
+        annual=previous_profit+diff
+        retained='3104' if c['standard']=='small2013' else '4104'
+        if annual>0: lines.extend([_entry(profit,annual),_entry(retained,credit=annual)])
+        elif annual<0: lines.extend([_entry(profit,credit=-annual),_entry(retained,-annual)])
+    if lines:
+        # An exact zero monthly result still has opposite profit/loss entries.
+        vid=_insert_voucher(conn,cid,_last_date(p),'期末损益结转',lines,user,'closing',p,True)
+    conn.execute('INSERT OR IGNORE INTO book_periods(client_id,period) VALUES(?,?)',(cid,p))
+    conn.execute('UPDATE book_periods SET closed=1,version=version+1,closed_at=?,closed_by=?,closing_voucher_id=? WHERE client_id=? AND period=?',(now(),(user or {}).get('id'),vid,cid,p))
+    audit(conn,user,'close','book',cid,{'period':p,'closing_voucher_id':vid,'checks':checks})
+    return {'period':p,'closed':True,'closing_voucher_id':vid,'checks':checks}
+
+
+def _reopen(conn,cid,payload,user):
+    p=_period(payload.get('period')); row=conn.execute('SELECT * FROM book_periods WHERE client_id=? AND period=?',(cid,p)).fetchone()
+    if not row or not row['closed']: raise ApiError(409,'该期间未结账')
+    if conn.execute('SELECT 1 FROM book_periods WHERE client_id=? AND period>? AND closed=1',(cid,p)).fetchone():
+        raise ApiError(409,'必须先反结账最近月份')
+    if payload.get('version') is not None: _version(row,payload)
+    if row['closing_voucher_id']:
+        conn.execute("UPDATE vouchers SET status='void',version=version+1 WHERE id=?",(row['closing_voucher_id'],))
+        audit(conn,user,'void_on_reopen','voucher',row['closing_voucher_id'],{'period':p})
+    conn.execute('UPDATE book_periods SET closed=0,version=version+1,closed_at=NULL,closed_by=NULL,closing_voucher_id=NULL WHERE client_id=? AND period=?',(cid,p))
+    audit(conn,user,'reopen','book',cid,{'period':p})
+    return {'period':p,'closed':False}
+
+
+def _asset_create(conn,cid,payload,user):
+    name=_text(payload.get('name'),'资产名称'); date=_date(payload.get('purchase_date')); _open(conn,cid,date[:7])
+    start=_period(payload.get('start_period'))
+    # Fixed assets in this scoped implementation start depreciation next month.
+    if start!=_month_add(date[:7],1): raise ApiError(400,'直线法资产从购置次月计提，请将起提月份设为购置次月')
+    cost=_positive(payload.get('cost_fen')); residual=amount(payload.get('residual_fen',0))
+    if residual>=cost: raise ApiError(400,'残值须小于资产原值')
+    life=payload.get('life_months')
+    if type(life) is not int or not 1<=life<=1200: raise ApiError(400,'使用月数须为1至1200的整数')
+    expense=_account(conn,cid,payload.get('expense_account')); asset=_account(conn,cid,payload.get('asset_account','1601')); dep=_account(conn,cid,payload.get('depreciation_account','1602')); counter=_account(conn,cid,payload.get('counter_account','1002'))
+    if expense['category'] not in ('expense','cost'): raise ApiError(400,'折旧借方须选费用或成本科目')
+    if asset['category']!='asset' or dep['category']!='asset' or asset['direction']!='debit' or dep['direction']!='credit': raise ApiError(400,'资产与累计折旧科目属性不匹配')
+    cur=conn.execute('INSERT INTO assets(client_id,name,purchase_date,start_period,cost_fen,residual_fen,life_months,expense_account,asset_account,depreciation_account) VALUES(?,?,?,?,?,?,?,?,?,?)',(cid,name,date,start,cost,residual,life,expense['code'],asset['code'],dep['code']))
+    aid=cur.lastrowid
+    vid=_insert_voucher(conn,cid,date,'购入固定资产 '+name,[_entry(asset['code'],cost),_entry(counter['code'],credit=cost,category='investing')],user,'asset_purchase',aid)
+    conn.execute('UPDATE assets SET purchase_voucher_id=? WHERE id=?',(vid,aid)); audit(conn,user,'create','asset',aid,payload)
+    return {'id':aid,'voucher_id':vid}
+
+
+def _depreciate(conn,cid,payload,user):
+    p=_period(payload.get('period')); _open(conn,cid,p); results=[]
+    for a in conn.execute("SELECT * FROM assets WHERE client_id=? AND status<>'cancelled' AND start_period<=? AND (disposal_date IS NULL OR substr(disposal_date,1,7)>=?) ORDER BY id",(cid,p,p)).fetchall():
+        a=dict(a)
+        exists=conn.execute('SELECT voucher_id,amount_fen FROM asset_depreciations WHERE asset_id=? AND period=?',(a['id'],p)).fetchone()
+        if exists:
+            results.append({'asset_id':a['id'],'voucher_id':exists['voucher_id'],'amount_fen':exists['amount_fen'],'already_posted':True}); continue
+        elapsed=(int(p[:4])-int(a['start_period'][:4]))*12+int(p[5:])-int(a['start_period'][5:])
+        previous=conn.execute('SELECT COUNT(*) n,COALESCE(SUM(amount_fen),0) total FROM asset_depreciations WHERE asset_id=? AND period<?',(a['id'],p)).fetchone()
+        base=a['cost_fen']-a['residual_fen']; remaining=base-previous['total']
+        if remaining<=0: continue
+        if previous['n']<min(elapsed,a['life_months']): raise ApiError(409,f'{a["name"]}存在未计提的以前月份，请按月计提')
+        if elapsed>=a['life_months']: continue
+        monthly=int((Decimal(base)/Decimal(a['life_months'])).quantize(Decimal('1'),rounding=ROUND_HALF_UP))
+        val=remaining if elapsed==a['life_months']-1 else min(monthly,remaining)
+        if val<=0:
+            # A sub-fen monthly allocation still needs a period record so that
+            # a tiny asset can reach its final-month cent without a false gap.
+            conn.execute('INSERT INTO asset_depreciations(asset_id,period,amount_fen,voucher_id) VALUES(?,?,0,NULL)',(a['id'],p))
+            conn.execute('UPDATE assets SET version=version+1 WHERE id=?',(a['id'],))
+            audit(conn,user,'zero_depreciation','asset',a['id'],{'period':p,'amount_fen':0})
+            results.append({'asset_id':a['id'],'voucher_id':None,'amount_fen':0,'already_posted':False})
+            continue
+        vid=_insert_voucher(conn,cid,_last_date(p),'计提折旧 '+a['name'],[_entry(a['expense_account'],val),_entry(a['depreciation_account'],credit=val)],user,'depreciation',f'{a["id"]}:{p}')
+        conn.execute('INSERT INTO asset_depreciations(asset_id,period,amount_fen,voucher_id) VALUES(?,?,?,?)',(a['id'],p,val,vid))
+        conn.execute('UPDATE assets SET version=version+1 WHERE id=?',(a['id'],)); audit(conn,user,'depreciate','asset',a['id'],{'period':p,'amount_fen':val,'voucher_id':vid})
+        results.append({'asset_id':a['id'],'voucher_id':vid,'amount_fen':val,'already_posted':False})
+    return {'period':p,'results':results}
+
+
+def _dispose(conn,cid,aid,payload,user):
+    a=conn.execute('SELECT * FROM assets WHERE client_id=? AND id=?',(cid,aid)).fetchone()
+    if not a: raise ApiError(404,'资产不存在')
+    _version(a,payload)
+    if a['status']!='active': raise ApiError(409,'资产已处置')
+    date=_date(payload.get('date')); _open(conn,cid,date[:7])
+    if date<a['purchase_date']: raise ApiError(400,'处置日期不能早于购置日期')
+    if conn.execute('SELECT 1 FROM asset_depreciations WHERE asset_id=? AND period>?',(aid,date[:7])).fetchone(): raise ApiError(409,'已计提后续月份折旧，不能追溯处置')
+    total=conn.execute('SELECT COALESCE(SUM(amount_fen),0) FROM asset_depreciations WHERE asset_id=?',(aid,)).fetchone()[0]
+    if date[:7]>=a['start_period'] and total<a['cost_fen']-a['residual_fen'] and not conn.execute('SELECT 1 FROM asset_depreciations WHERE asset_id=? AND period=?',(aid,date[:7])).fetchone():
+        raise ApiError(409,'须先计提处置月份折旧')
+    proceeds=amount(payload.get('proceeds_fen',0)); bank=_account(conn,cid,payload.get('bank_account','1002'))
+    if not _cash(bank): raise ApiError(400,'处置收款请选择货币资金科目')
+    c=_client(conn,cid); gain='5301' if c['standard']=='small2013' else '6301'; loss='5711' if c['standard']=='small2013' else '6711'
+    lines=[_entry(a['asset_account'],credit=a['cost_fen'])]
+    if total: lines.append(_entry(a['depreciation_account'],total))
+    if proceeds: lines.append(_entry(bank['code'],proceeds,category='investing'))
+    difference=proceeds-(a['cost_fen']-total)
+    if difference>0: lines.append(_entry(gain,credit=difference))
+    elif difference<0: lines.append(_entry(loss,-difference))
+    vid=_insert_voucher(conn,cid,date,'处置固定资产 '+a['name'],lines,user,'asset_disposal',aid)
+    conn.execute("UPDATE assets SET status='disposed',disposal_date=?,disposal_voucher_id=?,version=version+1 WHERE id=?",(date,vid,aid))
+    audit(conn,user,'dispose','asset',aid,{'date':date,'proceeds_fen':proceeds,'accumulated_fen':total,'voucher_id':vid})
+    return {'id':aid,'voucher_id':vid}
+
+
+def _item_create(conn,cid,payload,user):
+    sku=_text(payload.get('sku'),'商品编码',50); name=_text(payload.get('name'),'商品名称'); unit=_text(payload.get('unit'),'计量单位',20)
+    c=_client(conn,cid); inv=_account(conn,cid,payload.get('inventory_account','1405')); cost=_account(conn,cid,payload.get('cost_account','5401' if c['standard']=='small2013' else '6401'))
+    if inv['category']!='asset' or inv['report_key']!='inventory': raise ApiError(400,'存货控制科目须为资产类存货科目')
+    if cost['category']!='expense': raise ApiError(400,'出库成本须为损益费用科目')
+    cur=conn.execute('INSERT INTO inventory_items(client_id,sku,name,unit,inventory_account,cost_account) VALUES(?,?,?,?,?,?)',(cid,sku,name,unit,inv['code'],cost['code']))
+    audit(conn,user,'create','inventory_item',cur.lastrowid,payload)
+    return dict(conn.execute('SELECT * FROM inventory_items WHERE id=?',(cur.lastrowid,)).fetchone())
+
+
+def _create_account(conn,cid,payload,user):
+    name=_text(payload.get('name'),'科目名称',80)
+    parent_code=payload.get('parent_code')
+    if parent_code is not None:
+        parent_code=_text(parent_code,'上级科目编码',20)
+        parent=_account(conn,cid,parent_code)
+        if len(parent_code)>18: raise ApiError(400,'上级科目编码过长，无法再增加两位下级编码')
+        # Reserve an occupied branch even when older, manually entered
+        # codes have an intermediate level missing or only one digit.
+        suffixes=[]
+        for row in conn.execute('SELECT code FROM accounts WHERE client_id=? AND code LIKE ? AND code<>?',(cid,parent_code+'%',parent_code)):
+            suffix=row['code'][len(parent_code):]
+            if suffix.isdigit(): suffixes.append(int(suffix[:2].ljust(2,'9')))
+        sequence=max(suffixes,default=0)+1
+        if sequence>99: raise ApiError(409,'该上级科目的两位下级编码已用完')
+        code=parent_code+f'{sequence:02d}'
+        direction=parent['direction']; category=parent['category']; key=parent['report_key']
+    else:
+        code=_text(payload.get('code'),'科目编码',20)
+        direction=payload.get('direction'); category=payload.get('category'); key=payload.get('report_key')
+    if not re.fullmatch(r'\d{4,20}',code): raise ApiError(400,'科目编码必须为4至20位数字')
+    if direction not in ('debit','credit') or category not in CATEGORIES: raise ApiError(400,'科目方向或类别无效')
+    parents=[dict(x) for x in conn.execute('SELECT * FROM accounts WHERE client_id=? AND length(code)<length(?) AND ? LIKE code||\'%\' ORDER BY length(code) DESC',(cid,code,code))]
+    if len(code)>4:
+        if not parents: raise ApiError(400,'新增明细科目须先建立上级科目')
+        parent=parents[0]
+        if category!=parent['category'] or direction!=parent['direction']: raise ApiError(400,'明细科目类别及方向须与上级一致')
+        if conn.execute("SELECT 1 FROM voucher_lines l JOIN vouchers v ON v.id=l.voucher_id WHERE l.client_id=? AND l.account_code=? AND v.status='active'",(cid,parent['code'])).fetchone() or conn.execute('SELECT 1 FROM opening_balances WHERE client_id=? AND account_code=? AND (debit_fen<>0 OR credit_fen<>0)',(cid,parent['code'])).fetchone():
+            raise ApiError(409,'上级科目已使用，不能直接转为非末级科目')
+        key=parent['report_key']
+    if not key: key={'asset':'other_asset','liability':'other_liability','equity':'retained','income':'other_income','expense':'other_expense','cost':'inventory'}[category]
+    valid_keys={
+        'asset':{'cash','short_investment','receivable','prepaid','inventory','long_investment','fixed_asset','construction','intangible','other_asset'},
+        'cost':{'inventory','construction','other_asset'},'liability':{'short_debt','payable','advance','payroll_payable','tax_payable','other_liability','long_debt'},
+        'equity':{'capital','retained','current_profit'},'income':{'revenue','investment_income','other_income'},
+        'expense':{'business_cost','taxes','selling','administration','finance','other_expense','income_tax'}}
+    if key not in valid_keys[category]: raise ApiError(400,'报表分类与科目类别不符')
+    cur=conn.execute('INSERT INTO accounts(client_id,code,name,direction,category,report_key) VALUES(?,?,?,?,?,?)',(cid,code,name,direction,category,key)); audit(conn,user,'create','account',cur.lastrowid,{**payload,'code':code})
+    return dict(conn.execute('SELECT * FROM accounts WHERE id=?',(cur.lastrowid,)).fetchone())
+
+
+def _delete_account(conn,cid,aid,payload,user):
+    row=conn.execute('SELECT * FROM accounts WHERE id=? AND client_id=?',(aid,cid)).fetchone()
+    if not row: raise ApiError(404,'科目不存在')
+    _version(row,payload)
+    if row['code'] in {a[0] for a in _template(_client(conn,cid)['standard'])}:
+        raise ApiError(409,'会计制度预置科目保留；仅未使用的自定义末级科目可以删除')
+    if conn.execute('SELECT 1 FROM accounts WHERE client_id=? AND code LIKE ? AND code<>?',(cid,row['code']+'%',row['code'])).fetchone():
+        raise ApiError(409,'该科目存在下级科目，请先处理下级科目')
+    if conn.execute('SELECT 1 FROM accounting_voucher_lines WHERE client_id=? AND account_code=?',(cid,row['code'])).fetchone():
+        raise ApiError(409,'该科目已有凭证引用（包括作废凭证），需保留历史，不能删除')
+    if conn.execute('SELECT 1 FROM opening_balances WHERE client_id=? AND account_code=? AND (debit_fen<>0 OR credit_fen<>0)',(cid,row['code'])).fetchone():
+        raise ApiError(409,'该科目有期初余额，不能删除；新账套可先在期初设置中更正')
+    references=[
+        ('assets','asset_account=? OR depreciation_account=? OR expense_account=?',3,'资产卡片'),
+        ('inventory_items','inventory_account=? OR cost_account=?',2,'库存商品'),
+        ('payroll','expense_account=?',1,'工资记录'),
+        ('journals','bank_account=? OR counter_account=?',2,'资金流水'),
+    ]
+    for table,condition,n,label in references:
+        if conn.execute(f'SELECT 1 FROM {table} WHERE client_id=? AND ({condition}) LIMIT 1',[cid]+[row['code']]*n).fetchone():
+            raise ApiError(409,f'该科目被{label}使用，请先处理来源记录')
+    conn.execute('DELETE FROM opening_balances WHERE client_id=? AND account_code=?',(cid,row['code']))
+    conn.execute('DELETE FROM accounts WHERE id=? AND client_id=?',(aid,cid))
+    audit(conn,user,'delete','account',aid,{'before':dict(row),'reason':payload.get('reason','')})
+    return {'id':aid,'deleted':True}
+
+
+def _delete_item(conn,cid,iid,payload,user):
+    row=conn.execute('SELECT * FROM inventory_items WHERE id=? AND client_id=?',(iid,cid)).fetchone()
+    if not row: raise ApiError(404,'库存商品不存在')
+    _version(row,payload)
+    if Decimal(row['quantity'])!=0 or row['value_fen']!=0:
+        raise ApiError(409,'该商品仍有结存数量或金额，不能删除')
+    if conn.execute('SELECT 1 FROM inventory_movements WHERE item_id=?',(iid,)).fetchone():
+        raise ApiError(409,'该商品存在库存历史流水（包括撤回记录），须保留追溯，不能物理删除')
+    conn.execute('DELETE FROM inventory_items WHERE id=? AND client_id=?',(iid,cid))
+    audit(conn,user,'delete','inventory_item',iid,{'before':dict(row),'reason':payload.get('reason','')})
+    return {'id':iid,'deleted':True}
+
+
+def _delete_asset(conn,cid,aid,payload,user):
+    row=conn.execute('SELECT * FROM assets WHERE id=? AND client_id=?',(aid,cid)).fetchone()
+    if not row: raise ApiError(404,'资产不存在')
+    _version(row,payload)
+    if row['status']=='cancelled': raise ApiError(409,'购置已撤回，资产卡片与审计保留，无需重复删除')
+    if row['status']!='active' or row['disposal_voucher_id']:
+        raise ApiError(409,'资产已有处置，请先撤回处置及最近折旧，再撤回购置')
+    if conn.execute('SELECT 1 FROM asset_depreciations WHERE asset_id=?',(aid,)).fetchone():
+        raise ApiError(409,'资产已有折旧，请从最近月份起撤回折旧，再撤回购置')
+    if not row['purchase_voucher_id']: raise ApiError(409,'资产购置凭证缺失，不能直接删除')
+    voucher=_voucher(conn,cid,row['purchase_voucher_id'])
+    result=withdraw_source(conn,cid,voucher['id'],user,payload.get('reason'),voucher['version'])
+    return {'id':aid,'deleted':False,'withdrawn':True,'status':'cancelled','voucher_id':result['id']}
+
+
+def _movement(conn,cid,payload,user):
+    row=conn.execute('SELECT * FROM inventory_items WHERE client_id=? AND id=?',(cid,payload.get('item_id'))).fetchone()
+    if not row: raise ApiError(404,'商品不存在')
+    _version(row,payload); date=_date(payload.get('date')); _open(conn,cid,date[:7]); qty=_quantity(payload.get('quantity'))
+    if conn.execute("SELECT 1 FROM inventory_movements WHERE item_id=? AND status='active' AND date>?",(row['id'],date)).fetchone(): raise ApiError(409,'移动平均法禁止插入早于已有流水的日期')
+    oldqty=Decimal(row['quantity']); oldval=row['value_fen']; direction=payload.get('direction')
+    if direction=='in':
+        val=_positive(payload.get('amount_fen')); counter=_account(conn,cid,payload.get('counter_account','2202'))
+        if counter['code']==row['inventory_account']: raise ApiError(400,'入库对方科目不能为同一存货控制科目')
+        lines=[_entry(row['inventory_account'],val),_entry(counter['code'],credit=val,category=payload.get('cashflow_category','unclassified'))]
+        newqty=oldqty+qty; newval=oldval+val
+    elif direction=='out':
+        if qty>oldqty: raise ApiError(409,'库存数量不足，不允许负库存')
+        if oldqty<=0: raise ApiError(409,'没有可用库存')
+        val=oldval if qty==oldqty else int((Decimal(oldval)*qty/oldqty).quantize(Decimal('1'),rounding=ROUND_HALF_UP))
+        if val<=0: raise ApiError(400,'本次出库成本不足一分，请合并数量后出库')
+        lines=[_entry(row['cost_account'],val),_entry(row['inventory_account'],credit=val)]; newqty=oldqty-qty; newval=oldval-val
+    else: raise ApiError(400,'出入库方向无效')
+    amount(newval)
+    if newqty>Decimal('999999999999999.999999'):
+        raise ApiError(400,'累计库存数量超出15位整数及6位小数的限额')
+    cur=conn.execute('INSERT INTO inventory_movements(client_id,item_id,date,direction,quantity,amount_fen,created_at) VALUES(?,?,?,?,?,?,?)',(cid,row['id'],date,direction,format(qty,'f'),val,now())); mid=cur.lastrowid
+    vid=_insert_voucher(conn,cid,date,('采购入库 ' if direction=='in' else '销售出库结转成本 ')+row['name'],lines,user,'inventory',mid)
+    conn.execute('UPDATE inventory_movements SET voucher_id=? WHERE id=?',(vid,mid)); conn.execute('UPDATE inventory_items SET quantity=?,value_fen=?,version=version+1 WHERE id=?',(format(newqty,'f'),newval,row['id']))
+    audit(conn,user,'movement','inventory_item',row['id'],{'direction':direction,'quantity':str(qty),'amount_fen':val,'voucher_id':vid})
+    return {'id':mid,'voucher_id':vid,'amount_fen':val,'quantity':format(newqty,'f'),'value_fen':newval,'version':row['version']+1}
+
+
+def _payroll_values(conn,cid,payload):
+    p=_period(payload.get('period')); _open(conn,cid,p); name=_text(payload.get('employee_name'),'员工姓名',80)
+    gross=_positive(payload.get('gross_fen')); tax=amount(payload.get('withheld_tax_fen',0)); other=amount(payload.get('other_deduction_fen',0))
+    details=[amount(payload.get(key,0)) for key in ('pension_fen','medical_fen','unemployment_fen')]
+    social=amount(payload.get('social_fen',sum(details))); housing=amount(payload.get('housing_fund_fen',0))
+    if any(details) and social!=sum(details): raise ApiError(400,'个人社保合计须等于养老、医保、失业之和')
+    if tax+social+housing+other>gross: raise ApiError(400,'工资扣款合计不能超过工资总额')
+    a=_account(conn,cid,payload.get('expense_account'))
+    if a['category'] not in ('expense','cost'): raise ApiError(400,'工资借方须为成本费用科目')
+    if conn.execute('SELECT 1 FROM accounts WHERE client_id=? AND code LIKE ? AND code<>?',(cid,a['code']+'%',a['code'])).fetchone():
+        raise ApiError(400,'工资费用请选择末级科目')
+    extras=[]
+    for key,limit in (('employee_code',40),('department',80),('position',80),('note',500)):
+        value=payload.get(key,'')
+        if not isinstance(value,str) or len(value.strip())>limit: raise ApiError(400,'人员信息格式错误或超出长度限制')
+        extras.append(value.strip())
+    return (p,name,gross,tax,social,other,gross-tax-social-housing-other,a['code'],*extras,*details,housing)
+
+
+def _payroll_editable(conn,cid,period):
+    _open(conn,cid,period)
+    if conn.execute('SELECT 1 FROM payroll WHERE client_id=? AND period=? AND (voucher_id IS NOT NULL OR payment_voucher_id IS NOT NULL)',(cid,period)).fetchone():
+        raise ApiError(409,'本期已计提或发放，请先撤回工资发放及计提凭证再修改人员和工资')
+
+
+def _payroll_create(conn,cid,payload,user):
+    values=_payroll_values(conn,cid,payload)
+    _payroll_editable(conn,cid,values[0])
+    if values[8] and conn.execute('SELECT 1 FROM payroll WHERE client_id=? AND period=? AND employee_code=?',(cid,values[0],values[8])).fetchone():
+        raise ApiError(409,'本期已存在相同员工编号')
+    cur=conn.execute('INSERT INTO payroll(client_id,period,employee_name,gross_fen,withheld_tax_fen,social_fen,other_deduction_fen,net_fen,expense_account,employee_code,department,position,note,pension_fen,medical_fen,unemployment_fen,housing_fund_fen) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(cid,*values))
+    audit(conn,user,'create','payroll',cur.lastrowid,payload)
+    return dict(conn.execute('SELECT * FROM payroll WHERE id=?',(cur.lastrowid,)).fetchone())
+
+
+def _payroll_update(conn,cid,ident,payload,user):
+    row=conn.execute('SELECT * FROM payroll WHERE client_id=? AND id=?',(cid,ident)).fetchone()
+    if not row: raise ApiError(404,'工资记录不存在')
+    _version(row,payload); _payroll_editable(conn,cid,row['period'])
+    if payload.get('period',row['period'])!=row['period']: raise ApiError(400,'工资记录不能跨月修改，请使用带入上月人员')
+    combined={**dict(row),**payload}
+    if 'social_fen' not in payload and any(key in payload for key in ('pension_fen','medical_fen','unemployment_fen')):
+        combined['social_fen']=sum(amount(combined[key]) for key in ('pension_fen','medical_fen','unemployment_fen'))
+    values=_payroll_values(conn,cid,combined)
+    if values[8] and conn.execute('SELECT 1 FROM payroll WHERE client_id=? AND period=? AND employee_code=? AND id<>?',(cid,values[0],values[8],ident)).fetchone():
+        raise ApiError(409,'本期已存在相同员工编号')
+    conn.execute('UPDATE payroll SET period=?,employee_name=?,gross_fen=?,withheld_tax_fen=?,social_fen=?,other_deduction_fen=?,net_fen=?,expense_account=?,employee_code=?,department=?,position=?,note=?,pension_fen=?,medical_fen=?,unemployment_fen=?,housing_fund_fen=?,version=version+1 WHERE id=?',(*values,ident))
+    audit(conn,user,'update','payroll',ident,{'before':dict(row),'after':payload})
+    return dict(conn.execute('SELECT * FROM payroll WHERE id=?',(ident,)).fetchone())
+
+
+def _payroll_carry(conn,cid,payload,user):
+    period=_period(payload.get('period')); source=_month_add(period,-1)
+    _payroll_editable(conn,cid,period)
+    if payload.get('source_period',source)!=source: raise ApiError(400,'仅可带入相邻上月的人员')
+    rows=[dict(x) for x in conn.execute('SELECT * FROM payroll WHERE client_id=? AND period=? ORDER BY id',(cid,source))]
+    if not rows: raise ApiError(400,'上月没有可带入的人员，请先添加人员工资')
+    existing=[dict(x) for x in conn.execute('SELECT * FROM payroll WHERE client_id=? AND period=?',(cid,period))]
+    names={x['employee_name'].strip().casefold() for x in existing}
+    codes={x['employee_code'].strip().casefold() for x in existing if x['employee_code']}
+    copied=[]; skipped=[]
+    for row in rows:
+        name=row['employee_name'].strip().casefold(); code=row['employee_code'].strip().casefold()
+        if name in names or (code and code in codes):
+            skipped.append(row['employee_name']); continue
+        # Always retain non-tax amounts, including requests from older pages
+        # that still send the retired reset_deductions option.
+        data={**row,'period':period,'withheld_tax_fen':0}
+        saved=_payroll_create(conn,cid,data,user); copied.append(saved['id']); names.add(name)
+        if code: codes.add(code)
+    audit(conn,user,'carry_forward','payroll',period,{'client_id':cid,'source_period':source,'copied_ids':copied,'skipped':skipped,'reset_withheld_tax':True})
+    return {'period':period,'source_period':source,'copied':len(copied),'skipped':skipped}
+
+
+def _payroll_post(conn,cid,payload,user):
+    p=_period(payload.get('period')); _open(conn,cid,p)
+    rows=conn.execute('SELECT * FROM payroll WHERE client_id=? AND period=? ORDER BY id',(cid,p)).fetchall()
+    if not rows: raise ApiError(400,'本月没有工资记录')
+    existing={x['voucher_id'] for x in rows if x['voucher_id']}
+    if existing and any(not x['voucher_id'] for x in rows): raise ApiError(409,'本期已计提，不能追加工资；请在下一期间录入调整工资')
+    if existing: return {'period':p,'voucher_id':next(iter(existing)),'already_posted':True}
+    by={}
+    for r in rows: by[r['expense_account']]=by.get(r['expense_account'],0)+r['gross_fen']
+    total=sum(by.values()); lines=[_entry(k,v) for k,v in by.items()]; lines.append(_entry('2211',credit=total))
+    vid=_insert_voucher(conn,cid,_last_date(p),'计提应付工资（个税由人工录入）',lines,user,'payroll',p)
+    conn.execute('UPDATE payroll SET voucher_id=?,version=version+1 WHERE client_id=? AND period=?',(vid,cid,p)); audit(conn,user,'post','payroll',p,{'client_id':cid,'voucher_id':vid,'gross_fen':total})
+    return {'period':p,'voucher_id':vid,'already_posted':False}
+
+
+def _payroll_pay(conn,cid,payload,user):
+    p=_period(payload.get('period')); date=_date(payload.get('date')); _open(conn,cid,date[:7])
+    if date[:7]<p: raise ApiError(400,'发薪日期不能早于工资期间')
+    rows=conn.execute('SELECT * FROM payroll WHERE client_id=? AND period=?',(cid,p)).fetchall()
+    if not rows or any(not x['voucher_id'] for x in rows): raise ApiError(409,'须先计提工资')
+    if any(x['payment_voucher_id'] for x in rows): raise ApiError(409,'该期工资已发放')
+    bank=_account(conn,cid,payload.get('bank_account','1002'))
+    if not _cash(bank): raise ApiError(400,'请选择货币资金账户')
+    gross=sum(x['gross_fen'] for x in rows); tax=sum(x['withheld_tax_fen'] for x in rows); other=sum(x['social_fen']+x['housing_fund_fen']+x['other_deduction_fen'] for x in rows); net=sum(x['net_fen'] for x in rows)
+    lines=[_entry('2211',gross)]
+    if net: lines.append(_entry(bank['code'],credit=net,category='operating'))
+    if tax: lines.append(_entry('2221',credit=tax))
+    if other: lines.append(_entry('2241',credit=other))
+    vid=_insert_voucher(conn,cid,date,'发放工资及转列人工代扣款',lines,user,'payroll_payment',p)
+    conn.execute('UPDATE payroll SET payment_voucher_id=?,version=version+1 WHERE client_id=? AND period=?',(vid,cid,p)); audit(conn,user,'pay','payroll',p,{'client_id':cid,'voucher_id':vid,'net_fen':net})
+    return {'period':p,'voucher_id':vid}
+
+
+def _yuan(fen):
+    return ('-' if fen<0 else '')+f'{abs(fen)//100}.{abs(fen)%100:02d}'
+
+
+def export_rows(conn,client_id,kind,period):
+    _client(conn,client_id); _period(period)
+    if kind=='bank':
+        headers=['日期','摘要','银行科目','对方科目','方向','金额','现金流分类','凭证号']
+        rows=[[r['date'],r['summary'],r['bank_account'],r['counter_account'],r['direction'],_yuan(r['amount_fen']),r['cashflow_category'],r['voucher_id'] or ''] for r in conn.execute('SELECT * FROM journals WHERE client_id=? AND period=? ORDER BY date,id',(client_id,period))]
+    elif kind=='vouchers':
+        headers=['日期','凭证号','摘要','科目编码','科目名称','借方','贷方','状态','已审核','现金流分类']
+        rows=[]
+        for r in conn.execute('''SELECT v.date,v.number,COALESCE(NULLIF(l.summary,''),v.summary),l.account_code,a.name,l.debit_fen,l.credit_fen,v.status,v.reviewed,l.cashflow_category FROM vouchers v JOIN accounting_voucher_lines l ON l.voucher_id=v.id JOIN accounts a ON a.client_id=l.client_id AND a.code=l.account_code WHERE v.client_id=? AND v.period=? ORDER BY v.number,l.id''',(client_id,period)):
+            rows.append([r[0],r[1],r[2],r[3],r[4],_yuan(r[5]),_yuan(r[6]),r[7],r[8],r[9]])
+    elif kind=='trial-balance':
+        headers=['科目编码','科目名称','期初借方','期初贷方','本期借方','本期贷方','期末借方','期末贷方']
+        keys=['opening_debit_fen','opening_credit_fen','debit_fen','credit_fen','closing_debit_fen','closing_credit_fen']
+        rows=[[r['account_code'],r['account_name']]+[_yuan(r[k]) for k in keys] for r in _trial(conn,client_id,period)]
+    else: raise ApiError(400,'不支持的财务导出类型')
+    return headers,rows
+
+
+def handle(conn,method,path,payload,user,query):
+    match=re.fullmatch(r'/api/books/(\d+)(?:/(.*))?',path)
+    if not match: return None
+    cid=int(match[1]); route=match[2] or ''; payload=payload or {}; query=query or {}; _client(conn,cid)
+    if method=='GET' and route=='payroll':
+        p=_period(query.get('period',dt.date.today().isoformat()[:7]))
+        return {'period':p,'rows':[dict(x) for x in conn.execute('SELECT * FROM payroll WHERE client_id=? AND period=? ORDER BY employee_name,id',(cid,p))]}
+    if method=='GET' and route=='voucher-templates':
+        return {'templates':[dict(x,lines=json.loads(x['lines_json'])) for x in conn.execute('SELECT * FROM voucher_templates WHERE client_id=? ORDER BY id DESC',(cid,))]}
+    if method=='GET' and route in ('balance','balance-total'):
+        all_book=route=='balance-total' or query.get('scope')=='all'
+        basis=query.get('basis','raw')
+        if basis not in ('raw','actual','standard'): raise ApiError(400,'余额表口径无效')
+        with conn:
+            if not conn.in_transaction: conn.execute('BEGIN')
+            if all_book:
+                client=_client(conn,cid)
+                accounts={row['code']:{'account_name':row['name']} for row in conn.execute('SELECT * FROM accounts WHERE client_id=?',(cid,))}
+                start=client['opening_period']; end=_balance_book_end(conn,cid,client,accounts)
+            else:
+                end=_period(query.get('end',query.get('period',dt.date.today().isoformat()[:7])))
+                start=_period(query.get('start',end))
+            result=(standard_balance_bundle if basis=='standard' else balance_bundle)(conn,cid,start,end)
+            result.update(scope='all' if all_book else 'range',all_book=all_book,basis=basis)
+            return result
+    if method=='GET' and not route:
+        p=_period(query.get('period',dt.date.today().isoformat()[:7]))
+        # One read transaction prevents a report composed from different commits.
+        with conn:
+            if not conn.in_transaction: conn.execute('BEGIN')
+            return bundle(conn,cid,p)
+    if method not in ('POST','PATCH','DELETE'): return None
+    try:
+        with _write(conn):
+            if method=='POST' and route=='voucher-templates':
+                name=_text(payload.get('name'),'模板名称',80); summary=_text(payload.get('summary'),'摘要')
+                lines=_lines(conn,cid,payload.get('lines')); word=payload.get('voucher_word','记')
+                if word not in ('记','收','付','转'): raise ApiError(400,'凭证字无效')
+                cur=conn.execute('INSERT INTO voucher_templates(client_id,name,summary,lines_json,voucher_word,created_at) VALUES(?,?,?,?,?,?)',(cid,name,summary,json.dumps(lines,ensure_ascii=False),word,now()))
+                audit(conn,user,'create','voucher_template',cur.lastrowid,{'client_id':cid,'name':name})
+                return {'id':cur.lastrowid,'name':name,'version':1}
+            tm=re.fullmatch(r'voucher-templates/(\d+)',route)
+            if method=='DELETE' and tm:
+                row=conn.execute('SELECT * FROM voucher_templates WHERE id=? AND client_id=?',(int(tm[1]),cid)).fetchone()
+                if not row: raise ApiError(404,'模板不存在')
+                _version(row,payload); conn.execute('DELETE FROM voucher_templates WHERE id=?',(row['id'],))
+                audit(conn,user,'delete','voucher_template',row['id'],{'client_id':cid,'name':row['name']})
+                return {'deleted':True}
+            deletion=re.fullmatch(r'(accounts|assets|inventory/items)/(\d+)',route)
+            if method=='DELETE' and deletion:
+                return {'accounts':_delete_account,'assets':_delete_asset,'inventory/items':_delete_item}[deletion[1]](conn,cid,int(deletion[2]),payload,user)
+            if method=='POST' and route=='accounts': return _create_account(conn,cid,payload,user)
+            if method=='POST' and route=='opening': return _opening(conn,cid,payload,user)
+            if method=='POST' and route=='vouchers':
+                if payload.get('source_type','manual')!='manual' or payload.get('source_id') is not None: raise ApiError(400,'手工凭证不得伪装为系统业务来源')
+                vid=_insert_voucher(conn,cid,payload.get('date'),payload.get('summary'),payload.get('lines'),user,attachment_count=payload.get('attachment_count',0))
+                _voucher_extras(conn,cid,vid,payload,user)
+                return _voucher(conn,cid,vid)
+            vm=re.fullmatch(r'vouchers/(\d+)(?:/(review|cashflow|withdraw))?',route)
+            if vm:
+                vid=int(vm[1]); row=_voucher(conn,cid,vid); _version(row,payload); _open(conn,cid,row['period'])
+                if row['status']!='active': raise ApiError(409,'凭证已作废')
+                if vm[2]=='withdraw' and method=='POST':
+                    return withdraw_source(conn,cid,vid,user,payload.get('reason'),payload.get('version'))
+                if vm[2]=='review' and method=='POST':
+                    if type(payload.get('reviewed')) is not bool: raise ApiError(400,'审核状态须为布尔值')
+                    reviewed=payload['reviewed']; conn.execute('UPDATE vouchers SET reviewed=?,reviewed_by=?,reviewed_at=?,version=version+1 WHERE id=?',(int(reviewed),(user or {}).get('id') if reviewed else None,now() if reviewed else None,vid)); audit(conn,user,'review','voucher',vid,{'reviewed':reviewed})
+                    return _voucher(conn,cid,vid)
+                if vm[2]=='cashflow' and method=='POST':
+                    classifications=payload.get('classifications')
+                    if not isinstance(classifications,list): raise ApiError(400,'请按分录指定分类')
+                    mapping={x.get('line_id'):x.get('category') for x in classifications}
+                    lines=[]
+                    for line in row['lines']:
+                        item=dict(line)
+                        if line['id'] in mapping: item['cashflow_category']=mapping[line['id']]
+                        lines.append(item)
+                    _lines(conn,cid,lines)
+                    validids={x['id'] for x in row['lines']}
+                    if any(i not in validids for i in mapping): raise ApiError(400,'分录不属于该凭证')
+                    for lid,cat in mapping.items(): conn.execute('UPDATE voucher_lines SET cashflow_category=? WHERE id=?',(cat,lid))
+                    conn.execute('UPDATE vouchers SET version=version+1 WHERE id=?',(vid,)); audit(conn,user,'cashflow_classify','voucher',vid,{'classifications':classifications})
+                    return _voucher(conn,cid,vid)
+                if vm[2]: return None
+                reconciliation_source=row['source_type'] in RECONCILIATION_VOUCHER_SOURCES
+                if row['source_type']!='manual' and not (method=='PATCH' and reconciliation_source):
+                    raise ApiError(409,'该凭证请通过来源业务更正')
+                if row['reviewed']: raise ApiError(409,'已审核凭证须先取消审核')
+                if method=='PATCH':
+                    date=_date(payload.get('date')); _open(conn,cid,date[:7])
+                    if date[:7]!=row['period']: raise ApiError(400,'凭证不能跨月修改，请作废后另建')
+                    summary=_text(payload.get('summary'),'摘要'); lines=_lines(conn,cid,payload.get('lines')); attachments=_attachment_count(payload.get('attachment_count',row['attachment_count']))
+                    if reconciliation_source:
+                        if date!=row['date']: raise ApiError(400,'凭证日期须与原入账日期一致')
+                        before_cash=[dict(line,is_cash=_cash(_account(conn,cid,line['account_code']))) for line in row['lines']]
+                        if _cash_net(lines)!=_cash_net(before_cash):
+                            raise ApiError(400,'货币资金分录净额须与原凭证的收付款金额及方向一致')
+                    conn.execute('UPDATE vouchers SET date=?,summary=?,attachment_count=?,version=version+1 WHERE id=?',(date,summary,attachments,vid)); conn.execute('DELETE FROM voucher_lines WHERE voucher_id=?',(vid,)); _store_voucher_lines(conn,cid,vid,lines,summary); audit(conn,user,'update','voucher',vid,{'before':row,'after':payload})
+                    _voucher_extras(conn,cid,vid,{'voucher_word':row['voucher_word'],**payload},user)
+                    return _voucher(conn,cid,vid)
+                if method=='DELETE':
+                    conn.execute("UPDATE vouchers SET status='void',version=version+1 WHERE id=?",(vid,)); audit(conn,user,'void','voucher',vid,{'before':row,'reason':payload.get('reason','')}); return _voucher(conn,cid,vid)
+            if method=='POST' and route=='balance-entries/delete': return delete_balance_entry(conn,cid,payload,user)
+            if method=='POST' and route=='balance-entries/delete-batch': return delete_balance_entries(conn,cid,payload,user)
+            if method=='POST' and route=='close': return _close(conn,cid,payload,user)
+            if method=='POST' and route=='reopen': return _reopen(conn,cid,payload,user)
+            if method=='POST' and route=='assets': return _asset_create(conn,cid,payload,user)
+            if method=='POST' and route=='assets/depreciate': return _depreciate(conn,cid,payload,user)
+            az=re.fullmatch(r'assets/(\d+)/depreciations/(\d{4}-\d{2})/withdraw',route)
+            if method=='POST' and az:
+                card=conn.execute('SELECT * FROM assets WHERE client_id=? AND id=?',(cid,int(az[1]))).fetchone()
+                if not card: raise ApiError(404,'资产不存在')
+                _version(card,payload); p=_period(az[2]); _open(conn,cid,p)
+                record=conn.execute('SELECT * FROM asset_depreciations WHERE asset_id=? AND period=?',(card['id'],p)).fetchone()
+                if not record: raise ApiError(404,'该月没有折旧记录')
+                if record['voucher_id']:
+                    v=_voucher(conn,cid,record['voucher_id'])
+                    return withdraw_source(conn,cid,v['id'],user,payload.get('reason'),v['version'])
+                if card['disposal_voucher_id'] or conn.execute('SELECT 1 FROM asset_depreciations WHERE asset_id=? AND period>?',(card['id'],p)).fetchone():
+                    raise ApiError(409,'请先撤回资产后续折旧及处置')
+                reason=_text(payload.get('reason'),'撤回原因',500)
+                conn.execute('DELETE FROM asset_depreciations WHERE id=?',(record['id'],)); conn.execute('UPDATE assets SET version=version+1 WHERE id=?',(card['id'],))
+                audit(conn,user,'withdraw_zero_depreciation','asset',card['id'],{'reason':reason,'before':dict(record)})
+                return {'id':card['id'],'period':p,'withdrawn':True}
+            am=re.fullmatch(r'assets/(\d+)/dispose',route)
+            if method=='POST' and am: return _dispose(conn,cid,int(am[1]),payload,user)
+            if method=='POST' and route=='inventory/items': return _item_create(conn,cid,payload,user)
+            if method=='POST' and route=='inventory/movements': return _movement(conn,cid,payload,user)
+            if method=='POST' and route=='payroll':
+                p=_period(payload.get('period'))
+                if conn.execute('SELECT 1 FROM payroll WHERE client_id=? AND period=? AND voucher_id IS NOT NULL',(cid,p)).fetchone(): raise ApiError(409,'本期已计提，工资记录锁定')
+                return _payroll_create(conn,cid,payload,user)
+            if method=='POST' and route=='payroll/post': return _payroll_post(conn,cid,payload,user)
+            if method=='POST' and route=='payroll/pay': return _payroll_pay(conn,cid,payload,user)
+            if method=='POST' and route=='payroll/carry-forward': return _payroll_carry(conn,cid,payload,user)
+            pm=re.fullmatch(r'payroll/(\d+)',route)
+            if pm and method=='PATCH': return _payroll_update(conn,cid,int(pm[1]),payload,user)
+            if pm and method=='DELETE':
+                row=conn.execute('SELECT * FROM payroll WHERE client_id=? AND id=?',(cid,int(pm[1]))).fetchone()
+                if not row: raise ApiError(404,'工资记录不存在')
+                _version(row,payload); _payroll_editable(conn,cid,row['period'])
+                if row['voucher_id']: raise ApiError(409,'已计提工资不能删除')
+                conn.execute('DELETE FROM payroll WHERE id=?',(row['id'],)); audit(conn,user,'delete','payroll',row['id'],{'before':dict(row),'reason':payload.get('reason','')}); return {'deleted':True}
+            if method=='POST' and route=='journals': return create_bank_journal(conn,cid,payload,user)
+            jm=re.fullmatch(r'journals/(\d+)(?:/(post))?',route)
+            if jm:
+                row=conn.execute('SELECT * FROM journals WHERE client_id=? AND id=?',(cid,int(jm[1]))).fetchone()
+                if not row: raise ApiError(404,'日记账不存在')
+                _version(row,payload); _open(conn,cid,row['period'])
+                if method=='POST' and jm[2]=='post':
+                    if row['voucher_id']: return {'id':row['id'],'voucher_id':row['voucher_id'],'already_posted':True}
+                    d=row['amount_fen'] if row['direction']=='income' else 0; cr=row['amount_fen'] if row['direction']=='expense' else 0
+                    candidates=[dict(x) for x in conn.execute("""SELECT DISTINCT v.id voucher_id,v.date,v.number,v.source_type,v.summary,
+                        (SELECT GROUP_CONCAT(a.code || ' ' || a.name, '；') FROM accounting_voucher_lines other
+                         JOIN accounts a ON a.client_id=other.client_id AND a.code=other.account_code
+                         WHERE other.voucher_id=v.id AND other.account_code<>l.account_code) counter_accounts
+                        FROM vouchers v JOIN accounting_voucher_lines l ON l.voucher_id=v.id
+                        WHERE v.client_id=? AND v.source_type='reconciliation' AND v.status='active' AND v.date=?
+                        AND l.account_code=? AND l.debit_fen=? AND l.credit_fen=? ORDER BY v.id""",
+                        (cid,row['date'],row['bank_account'],d,cr))]
+                    note=payload.get('duplicate_review_note','')
+                    if not isinstance(note,str) or len(note.strip())>500: raise ApiError(400,'重复核验说明须为不超过500字的文本')
+                    note=note.strip()
+                    if candidates and not note: raise ApiError(409,'发现日期、金额及银行科目相同的核对收付款凭证，可能重复；请核对是否为不同流水',{'code':'possible_duplicate','candidates':candidates})
+                    lines=[_entry(row['bank_account'],d,cr,row['cashflow_category']),_entry(row['counter_account'],cr,d,row['cashflow_category'] if row['cashflow_category']=='transfer' else 'unclassified')]
+                    vid=_insert_voucher(conn,cid,row['date'],row['summary'],lines,user,'bank',row['id']); conn.execute('UPDATE journals SET voucher_id=?,version=version+1 WHERE id=?',(vid,row['id'])); audit(conn,user,'post','journal',row['id'],{'voucher_id':vid,'duplicate_candidates':candidates,'duplicate_review_note':note if candidates else ''}); return {'id':row['id'],'voucher_id':vid,'already_posted':False}
+                if method=='DELETE' and not jm[2]:
+                    if row['voucher_id']: raise ApiError(409,'已生成凭证的日记账不能删除')
+                    conn.execute('DELETE FROM journals WHERE id=?',(row['id'],)); audit(conn,user,'delete','journal',row['id'],{'before':dict(row),'reason':payload.get('reason','')}); return {'deleted':True}
+            return None
+    except sqlite3.IntegrityError as exc:
+        raise ApiError(409,'记录重复或关联约束冲突，未保存') from exc

@@ -1,0 +1,14 @@
+{
+    "name":  "yidaizhang-local",
+    "version":  "0.1.12",
+    "private":  true,
+    "type":  "module",
+    "description":  "Local LAN accounting workspace; Python backend, local browser assets, no frontend build dependencies.",
+    "scripts":  {
+                    "check:payroll-master": "node --check public/payroll-master.js && python -m unittest discover -s tests -p test_payroll_master.py",
+                    "check:voucher-print": "node --check public/voucher-print.js && node --test tests/test_voucher_print.mjs",
+                    "check":  "node --check public/account-picker.js \u0026\u0026 node --check public/voucher-editor.js \u0026\u0026 node --check public/payroll.js \u0026\u0026 node --check public/payroll-report.js \u0026\u0026 node --check public/payroll-xlsx.js \u0026\u0026 node --check public/ledger-draft-household.js \u0026\u0026 node --check public/ledger-draft-expenses.js \u0026\u0026 node --check public/ledger-draft-catalog.js \u0026\u0026 node --check public/ledger-draft-model.js \u0026\u0026 node --check public/ledger-draft.js \u0026\u0026 node --check public/ledger-draft-xlsx.js \u0026\u0026 node --check public/source-archive.js \u0026\u0026 node --check public/reconcile.js \u0026\u0026 node --check public/reconcile-voucher.js \u0026\u0026 node --check public/home-overview.js \u0026\u0026 node --check public/sales-workspace.js \u0026\u0026 node --check public/app.js \u0026\u0026 node --check public/company-search.js \u0026\u0026 node --check public/contract-progress.js \u0026\u0026 node --check public/bookkeeping-list.js \u0026\u0026 node --check public/client-editor.js \u0026\u0026 node --check public/customer-list.js \u0026\u0026 node --check public/finance-ui.js \u0026\u0026 node --check public/company-workspace.js \u0026\u0026 node --check public/company-vouchers.js \u0026\u0026 node --check public/company-balance.js \u0026\u0026 node --check public/ticket-actions.js \u0026\u0026 node --check public/ticket-list.js \u0026\u0026 node --check public/tax-overview.js \u0026\u0026 node --check public/tax-actions.js \u0026\u0026 node public/modules/tax-liquidation/scripts/check.mjs",
+                    "test:tax-liquidation":  "node --test public/modules/tax-liquidation/tests/*.test.mjs",
+                    "test:sales":  "node --test tests/test_sales_statement.mjs"
+                }
+}
